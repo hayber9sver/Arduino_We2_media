@@ -190,6 +190,24 @@ static HardwareSerial atSerial(0);
 #endif
 static bool s_uart_proto_active = false;
 static bool s_we2_uart1_synced  = false;
+/* sendTaggedCommand()'s consecutive-timeout counter - see its comment and
+ * WE2_RESYNC_TIMEOUT_THRESHOLD below for why this exists. */
+static uint32_t s_consecutive_at_timeouts = 0;
+/* pollWe2Uart1Handshake()'s s_we2_uart1_synced latch is one-shot: once set,
+ * nothing ever clears it except an ESP32 reboot. That's fine as long as WE2
+ * and the ESP32 always reboot together, but if WE2 alone reboots/crashes
+ * (its own out_transport.c resets its transport choice back to USB-console
+ * and starts probing UART1 fresh, exactly like a cold boot), this ESP32
+ * never re-arms pollWe2Uart1Handshake() to answer that fresh probe - it
+ * already believes it's synced. Result: WE2 waits forever for an echo that
+ * never comes, never switches its output to UART1, and every AT command
+ * this sketch sends times out permanently until the ESP32 itself is also
+ * rebooted. Confirmed on hardware 2026-07-10/11: only a *simultaneous*
+ * reboot of both boards ever recovered a wedged link; either board
+ * rebooting alone did not. This threshold - N consecutive AT reply
+ * timeouts - is the trigger to assume that's what happened and re-arm the
+ * probe handshake automatically instead of requiring a manual ESP32 reboot. */
+#define WE2_RESYNC_TIMEOUT_THRESHOLD (2)
 
 void initSharedBuffer() { PB.mutex = xSemaphoreCreateMutex(); }
 
@@ -208,6 +226,12 @@ void startRemoteProxy(Proto through = PROTO_UART) {
         // a workaround is to modify uartBegin() in
         //     esp32/hardware/esp32/2.0.14/cores/esp32/esp32-hal-uart.c
         atSerial.setRxBufferSize(COM_BUFFER_SIZE);
+        // Reverted 2026-07-11 back to the default SSCMA_UART_BAUD (921600) -
+        // the real WE2 board only speaks 921600 on this link. (Was
+        // temporarily forced to 115200 earlier this session to validate the
+        // protocol logic against Orange Pi's ttyS5, which can't generate an
+        // accurate 921600 clock - 24MHz source, no integer divisor lands
+        // within ~15%+ of it.)
         AI.begin(&atSerial, D3);
         s_uart_proto_active = true;
         break;
@@ -364,10 +388,34 @@ static void proxyCallback(const char* resp, size_t len) {
  * point the WE2 sends nothing else on this line (all real AT/JSON traffic
  * stays on its USB port until the switch happens), so there's no risk of
  * stealing bytes fetchFramedMessages() needed. Once synced this becomes a
- * no-op forever (the WE2 never probes again once switched, per its own
+ * no-op (the WE2 never probes again once switched, per its own
  * out_transport.c comment), handing the line over to fetchFramedMessages()
  * exclusively - no race between the two, since only one of them is ever
- * actually consuming bytes at a time. */
+ * actually consuming bytes at a time. Not "forever" though: sendTaggedCommand()
+ * clears s_we2_uart1_synced back to false after WE2_RESYNC_TIMEOUT_THRESHOLD
+ * consecutive AT reply timeouts, re-arming this function - see its comment
+ * for why (WE2 rebooting independently of the ESP32 needs exactly this to
+ * recover without a manual ESP32 reboot).
+ *
+ * 2026-07-11: that resync-on-timeout only actually recovers the link if WE2
+ * ALSO reboots and starts probing again - but WE2 only probes on ITS OWN
+ * cold boot (per out_transport.c, "the WE2 never probes again once
+ * switched"). If WE2 never went down at all (the timeouts were caused by
+ * something else - e.g. a transient miss, or the sendTaggedCommand()
+ * matching bug fixed the same day this comment was written), clearing
+ * s_we2_uart1_synced here just deadlocks the link *permanently*: this
+ * function goes back to waiting for a 0x16 echo that will never arrive
+ * again, while WE2 keeps sending real replies that get silently discarded
+ * one byte at a time as "unexpected" below - confirmed on hardware, every
+ * single command timed out from that point on for the rest of the session.
+ * Fix: treat ANY non-probe byte as proof the peer is alive and already
+ * speaking the real protocol (not pre-handshake silence) and hand off to
+ * fetchFramedMessages() immediately instead of waiting for an echo that may
+ * never come. Only the one byte already consumed here is at risk of being
+ * lost - fetchFramedMessages() already tolerates and resyncs past stray
+ * unrecognized bytes on its own (see its own comment), so this is safe even
+ * if what triggered it turns out to be a stray/garbage byte rather than a
+ * real reply. */
 static void pollWe2Uart1Handshake() {
     if (s_we2_uart1_synced || !s_uart_proto_active) {
         return;
@@ -381,10 +429,10 @@ static void pollWe2Uart1Handshake() {
             log_i("WE2 UART1 handshake echoed - output should switch over shortly");
             return;
         }
-        // Anything else this early is unexpected (the WE2 shouldn't send
-        // real traffic on this line pre-handshake) - drop it rather than
-        // risk feeding a stray/misaligned byte into fetchFramedMessages().
-        log_w("Unexpected byte 0x%02x while waiting for WE2 UART1 handshake...", (unsigned)c);
+        log_w("Unexpected byte 0x%02x while waiting for WE2 UART1 handshake - treating as evidence "
+              "WE2 is already live and handing off to fetchFramedMessages()...", (unsigned)c);
+        s_we2_uart1_synced = true;
+        return;
     }
 }
 
@@ -998,19 +1046,38 @@ static std::shared_ptr<PtrBuffer::Slot> sendTaggedCommand(const char* body, size
         auto slots = PB.slots;
         xSemaphoreGive(PB.mutex);
 
+        // 2026-07-11: was `p->id - last_id <= 0` - both are size_t (unsigned),
+        // so that subtraction never goes negative; it silently wraps to a huge
+        // value instead, breaking the "already examined" filter for any slot
+        // older than last_id. Worse, the old code also reassigned `last_id =
+        // p->id` for every *non-matching* slot regardless of whether it was
+        // actually newer - including stale replies from a *previous*
+        // sendTaggedCommand() call still sitting in the (3-slot) ring, which
+        // could drag last_id backward/sideways and mask the genuinely fresh,
+        // correctly-tagged reply examined later in the very same scan.
+        // Confirmed on hardware: a reply could be pushed and correctly
+        // classified as MSG_TYPE_REPLY (visible in pushPBSlot()'s own log)
+        // and this loop would still never find it, timing out every time.
+        // A plain unsigned `<=` with no mutation is both correct and simpler
+        // - PTR_BUFFER_SIZE is only 3, so re-scanning the whole ring every
+        // 5ms costs nothing.
         auto it = std::find_if(slots.begin(), slots.end(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
-            if (p->id - last_id <= 0) {
+            // pushPBSlot() assigns p_slot->id = PB.id *before* incrementing
+            // PB.id (see its own code) - so the very next slot pushed after
+            // `last_id = PB.id` was captured above gets an id exactly equal
+            // to last_id, not greater. `<=` here would filter out precisely
+            // the reply this call is waiting for - confirmed on hardware:
+            // pushPBSlot() logged a correctly-classified REPLY landing, and
+            // this still timed out every single time until changed to `<`.
+            if (p->id < last_id) {
                 return false;
             }
-
             if (p->type & MSG_TYPE_REPLY || p->type & MSG_TYPE_LOGGI) {
                 const char* tag = strnstr((const char*)p->data, cmd_tag_buf, p->size);
                 if (tag != NULL) {
                     return true;
                 }
             }
-
-            last_id = p->id;
             return false;
         });
         if (it == slots.end()) {
@@ -1020,12 +1087,26 @@ static std::shared_ptr<PtrBuffer::Slot> sendTaggedCommand(const char* body, size
         xSemaphoreTake(PB.mutex, portMAX_DELAY);
         s_awaited_tag[0] = '\0';
         xSemaphoreGive(PB.mutex);
+        s_consecutive_at_timeouts = 0;
         return *it;
     }
 
     xSemaphoreTake(PB.mutex, portMAX_DELAY);
     s_awaited_tag[0] = '\0';
     xSemaphoreGive(PB.mutex);
+
+    if (++s_consecutive_at_timeouts >= WE2_RESYNC_TIMEOUT_THRESHOLD) {
+        log_w("sendTaggedCommand: %u consecutive AT reply timeouts - assuming WE2 "
+              "rebooted independently and lost UART1 sync, re-arming probe handshake...",
+              (unsigned)s_consecutive_at_timeouts);
+        s_we2_uart1_synced        = false;
+        s_consecutive_at_timeouts = 0;
+        // Whatever's sitting in fetchFramedMessages()'s buffer is now stale
+        // (mid-parse of a reply that's never coming) - drop it so a dangling
+        // partial pattern can't delay recognizing real traffic once WE2
+        // actually reconnects and pollWe2Uart1Handshake() hands the line back.
+        s_fetch_len = 0;
+    }
     return nullptr;
 }
 

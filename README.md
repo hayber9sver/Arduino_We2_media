@@ -1,45 +1,58 @@
-Project Description
+# Grove Vision AI V2 Web Camera Example
 
-This is an Arduino sketch running on a XIAO ESP32C3, acting as a wireless bridge layer for a WE2 device (Grove Vision AI V2 / SSCMA). The ESP32C3 talks to WE2 over UART1 (Grove header pins, PB7=TX/PB6=RX) and wraps WE2's AT command protocol into an HTTP API, so you can control the camera/audio, pull detection results, and read data streams directly over the network — no web UI, purely an API/streaming backend.
+![Tracking Example](img/example_0.gif)
 
-Architecture
+Run AI models, streaming, tracking and visualizing the results using [Grove Vision AI V2](https://www.seeedstudio.com/Grove-Vision-AI-V2-Kit-p-5852.html) on a web page, an expanded rework of [ESP32 CameraWebServer](https://github.com/espressif/arduino-esp32/tree/master/libraries/ESP32/examples/Camera/CameraWebServer).
 
-- Control: plain HTTP GET with query params (/camera/start?resolution=X, /audio/start?rate=X, etc.) — one request, one response
-- Continuous data: either an always-open connection that keeps streaming (/stream/frame, /stream/audio), or long-polling (/result, each call waits up to 3s for one new result)
-- Capture tool: client/media_client.py — configures settings, starts/stops, saves output, runs as a background daemon; defaults to saving under /home/orangepi/ESP32_wireless/capture
+## Prerequisites
 
-API Endpoints
+Software:
 
-┌───────────────────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
-│                     Endpoint                      │                              Purpose                               │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /camera/start?resolution=0|1|2&mode=invoke|sample │ Start the camera (240x240/480x480/640x480)                         │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /camera/stop                                      │ Stop (AT+BREAK — shared stop command for both camera and audio)    │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /audio/start?rate=16000|32000                     │ Start audio                                                        │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /audio/stop                                       │ Same shared BREAK                                                  │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /command?base64=...                               │ Pass through any raw AT command                                    │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /result                                           │ Long-poll for one bbox detection result (JSON, no image data)      │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /stream/frame (port 8080)                         │ Continuous MJPEG image stream                                      │
-├───────────────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
-│ /stream/audio (port 8080)                         │ Continuous raw binary audio stream (WE2's own custom frame format) │
-└───────────────────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘
+- [Arduino IDE](https://www.arduino.cc/en/software)
+- [Seeed_Arduino_SSCMA](https://github.com/seeed-studio/Seeed_Arduino_SSCMA)
+- [ArduinoJson](https://arduinojson.org/v7/how-to/install-arduinojson/)
+- [ArduinoEigen](https://www.arduino.cc/reference/en/libraries/eigen/)
 
-Disconnect protection: /stream/frame and /stream/audio detect client disconnects and automatically send AT+BREAK to stop the WE2-side stream, with a debounce guard to prevent repeated commands if this ever fires in a burst.
+Hardware:
 
-Capability Limits
+- [Grove Vision AI V2](https://www.seeedstudio.com/Grove-Vision-AI-V2-Kit-p-5852.html)
+- Espressif Arduino capble MCU board that supports Wi-Fi, e.g. [XIAO (ESP32)](https://www.seeedstudio.com/XIAO-ESP32S3-p-5627.html)
+- Router
 
-1. UART1 baud rate capped at 921600bps — this is the documented hardware ceiling in WE2's driver, not adjustable further.
-2. Very limited memory (ESP32C3 only has ~86KB free heap):
-  - PTR_BUFFER_SIZE=3: the shared buffer only holds 3 slots — multiple concurrent streams evict each other's data
-  - JPG_BUFFER_SIZE=8KB: only enough for the 240x240 debug preview; 480x480/640x480 will fail to decode
-  - Single-threaded httpd: only one request is handled at a time; under heavy load, requests queue up and lag
-3. 32kHz audio + bbox running together is unstable (root-caused: WE2's own 32kHz audio generation is confirmed clean in isolation — the problem is that it doesn't fit alongside bbox/INVOKE traffic on the shared 921600 UART1 link, occasionally crashing the board or dropping large chunks of audio). 16kHz audio + bbox is confirmed stable (~90 seconds combined test time, zero crashes, 100% bbox integrity / 99.5% audio integrity).
-4. Running camera + audio + image streaming all at once overloads the board — running all three simultaneously exceeds capacity; only enable what you actually need (e.g., a human presence sensor only needs bbox + audio, not saved video frames).
-5. Occasional crash-and-reboot after extended operation (root cause not fully identified, suspected heap fragmentation; recovers on its own after rebooting, but long-term 24/7 reliability hasn't been verified).
-6. No longer supports the ESP32S3 board — the code has been trimmed to target C3 only, removing the BYTETracker tracking algorithm that was only ever enabled for S3.
+**Note: Due to hardware resource constraints, bytetrack is only available when running server on ESP32-S3, and we also recommand you to use the device which has more than 512KB SRAM when the streaming resolution is greater than 240x240.*
+
+## Getting Started
+
+1. Install the required libraries in Arduino IDE.
+2. Open the example in Arduino IDE: `File` -> `Examples` -> `Seeed_Arduino_SSCMA` -> `camera_web_server`.
+3. Select the correct board and port.
+4. Edit the `ssid` and `password` in the `camera_web_server.ino` sketch to match your Wi-Fi network.
+5. Upload the sketch to the board, and open the Serial Monitor, when connected to the Wi-Fi network, the IP address of the board will be printed, connect to it using a web browser.
+
+## Features
+
+### HTTP API
+
+- `/` - Main page with a video stream from the camera
+- `/stream` - Stream from the camera (stream server runs on port 8080)
+    - `/stream/frame` - camera fream example
+    - `/stream/result` - invoke/sample raw results in JSON format
+- `/command?base64=` - Send a base64 encoded AT command to the board
+
+### URL only streaming
+
+You can use the URL `http://<IP_ADDRESS>/stream/frame` to view the camera stream on browsers or other APPS that support MJPEG streaming without any additinal process.
+
+![Streaming Example](img/example_1.gif)
+
+### AI inference results visualization
+
+The web camera page supports visualizing bounding boexes, poses, classes and keypoints, and for each trackable objects (bounding boxes), we put a unique ID on its top left corner.
+
+![Pose Example](img/example_2.gif)
+
+### Userfriendly error handling
+
+The web camera page will notify the user if there is an issue during streaming and the potential cause of the issue, e.g. the camera cable is lossen, or the device lost connection to the Wi-Fi network.
+
+![Error handling Example](img/example_3.gif)
