@@ -27,13 +27,21 @@ Endpoints used (all against --host, default port 80 unless noted):
                                       for a quick manual check)
 
 Usage:
-    media_client.py start --host 192.168.1.1 --outdir ./capture \\
-        [--camera] [--audio] [--resolution 0|1|2] [--rate 16000|32000]
+    media_client.py start --host 192.168.1.112 --outdir ./capture \\
+        [--camera] [--audio] [--resolution 0|1|2] [--rate 16000|32000] \\
+        [--user <user>] [--password <password>]
     media_client.py stop [--outdir ./capture]
     media_client.py status [--outdir ./capture]
-    media_client.py once --host 192.168.1.1   # one-shot /result check, no capture
+    media_client.py once --host 192.168.1.112   # one-shot /result check, no capture
 
 start with neither --camera nor --audio enables both.
+
+Every endpoint on the ESP32 requires HTTP Basic Auth (see app_httpd.cpp's
+checkAuth()/initHttpAuth(), 2026-07-13) - --user/--password must match the
+firmware's HTTP_AUTH_USER/HTTP_AUTH_PASS #defines, no default credentials
+are baked into this script. Note: the board's IP can change across reboots
+(DHCP) - if this client can't connect at all, verify the current IP before
+assuming an auth or firmware problem.
 
 Output layout (under --outdir):
     results.jsonl                 - one JSON line per AI inference (bbox)
@@ -51,6 +59,7 @@ new detections (a deliberate idle-timeout backstop on its side) - this
 client treats that the same as any other drop and just reconnects.
 """
 import argparse
+import base64
 import json
 import os
 import signal
@@ -66,13 +75,28 @@ AUDIO_MAGIC = b"\xffSMB"
 AUDIO_HEADER_LEN = 16
 AUDIO_CRC_LEN = 2
 
+# HTTP Basic Auth credentials - every endpoint on the ESP32 requires these
+# (see app_httpd.cpp's checkAuth()). No default is baked in here on purpose
+# (avoid committing a real credential to this file) - set from --user/
+# --password (required) in cmd_start()/cmd_once() before any request is
+# made; module-level so http_get()/the stream readers don't all need an
+# extra parameter threaded through them.
+AUTH_USER = None
+AUTH_PASS = None
+
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def auth_header():
+    cred = f"{AUTH_USER}:{AUTH_PASS}".encode()
+    return "Basic " + base64.b64encode(cred).decode()
+
+
 def http_get(url, timeout=5):
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    req = urllib.request.Request(url, headers={"Authorization": auth_header()})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
@@ -110,7 +134,8 @@ def read_bbox_stream(base, results_path, stop_event):
     with open(results_path, "a") as out:
         while not stop_event.is_set():
             try:
-                with urllib.request.urlopen(url, timeout=15) as resp:
+                req = urllib.request.Request(url, headers={"Authorization": auth_header()})
+                with urllib.request.urlopen(req, timeout=15) as resp:
                     buf = b""
                     while not stop_event.is_set():
                         chunk = resp.read(4096)
@@ -154,7 +179,8 @@ def read_audio_stream(base, wav_path, stop_event):
 
     while not stop_event.is_set():
         try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
+            req = urllib.request.Request(url, headers={"Authorization": auth_header()})
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 buf = b""
                 while not stop_event.is_set():
                     chunk = resp.read(4096)
@@ -274,6 +300,9 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
 # ---------------------------------------------------------------------------
 
 def cmd_start(args):
+    global AUTH_USER, AUTH_PASS
+    AUTH_USER, AUTH_PASS = args.user, args.password
+
     outdir = os.path.abspath(args.outdir)
     os.makedirs(outdir, exist_ok=True)
     pf = pid_file(outdir)
@@ -366,6 +395,9 @@ def cmd_status(args):
 def cmd_once(args):
     """One-shot sanity check against GET /result - the single newest AI
     inference (bbox) batch, without starting a background capture."""
+    global AUTH_USER, AUTH_PASS
+    AUTH_USER, AUTH_PASS = args.user, args.password
+
     base = f"http://{args.host}"
     try:
         body = http_get(base + "/result", timeout=8)
@@ -388,6 +420,8 @@ def main():
     p_start.add_argument("--resolution", type=int, default=2, choices=[0, 1, 2],
                           help="0=240x240, 1=480x480, 2=640x480")
     p_start.add_argument("--rate", type=int, default=16000, choices=[16000, 32000])
+    p_start.add_argument("--user", required=True, help="HTTP Basic Auth username (must match the board's HTTP_AUTH_USER)")
+    p_start.add_argument("--password", required=True, help="HTTP Basic Auth password (must match the board's HTTP_AUTH_PASS)")
     p_start.set_defaults(func=cmd_start)
 
     p_stop = sub.add_parser("stop")
@@ -400,6 +434,8 @@ def main():
 
     p_once = sub.add_parser("once", help="one-shot GET /result, no capture started")
     p_once.add_argument("--host", default="192.168.1.112")
+    p_once.add_argument("--user", required=True)
+    p_once.add_argument("--password", required=True)
     p_once.set_defaults(func=cmd_once)
 
     args = p.parse_args()

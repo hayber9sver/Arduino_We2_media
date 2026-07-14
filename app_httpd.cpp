@@ -502,9 +502,65 @@ static uint32_t s_consecutive_at_timeouts = 0;
  * probe handshake automatically instead of requiring a manual ESP32 reboot. */
 #define WE2_RESYNC_TIMEOUT_THRESHOLD (2)
 
+/* 2026-07-13: HTTP Basic Auth, required on every endpoint (control commands
+ * AND the /stream/* and /result endpoints) - per explicit direction, change
+ * these two to whatever credentials are actually wanted. Any client (a
+ * browser, curl, or media_client.py) must send an `Authorization: Basic
+ * <base64(user:pass)>` header matching s_expected_auth_hdr (computed once at
+ * boot in initHttpAuth()) or gets a 401. Plain strcmp, not constant-time -
+ * fine for this board's threat model (local network, not a public-internet
+ * service), not appropriate to reuse as-is somewhere timing attacks matter.
+ *
+ * Re-added 2026-07-13 after a first attempt was reverted on suspicion of
+ * causing a boot crash - on investigation the board never actually crashed
+ * from this code: DHCP handed it a new IP after a reflash/power-cycle, so
+ * requests against the old IP looked like total failure, compounded by the
+ * WE2 UART1 handshake needing longer than usual to settle that particular
+ * boot. Re-verify end to end against whatever IP the board actually has
+ * before assuming a regression next time. */
+#define HTTP_AUTH_USER ""
+#define HTTP_AUTH_PASS ""
+
+static char s_expected_auth_hdr[64] = {0};  // "Basic <base64(user:pass)>", filled in by initHttpAuth()
+
+static void initHttpAuth() {
+    char cred[64];
+    int  cred_len = snprintf(cred, sizeof(cred), "%s:%s", HTTP_AUTH_USER, HTTP_AUTH_PASS);
+
+    unsigned char b64[96]  = {0};
+    size_t        b64_len  = 0;
+    mbedtls_base64_encode(b64, sizeof(b64), &b64_len, (const unsigned char*)cred, cred_len);
+
+    snprintf(s_expected_auth_hdr, sizeof(s_expected_auth_hdr), "Basic %.*s", (int)b64_len, (const char*)b64);
+}
+
+/* Called as the first line of every registered handler (see each handler's
+ * own body). Sends the 401 + WWW-Authenticate response itself on failure -
+ * callers just need to `return ESP_FAIL` right after a false-returning call,
+ * they don't build any response of their own in that case. */
+static bool checkAuth(httpd_req_t* req) {
+    char hdr[96] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof(hdr)) != ESP_OK) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32\"");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return false;
+    }
+    if (strcmp(hdr, s_expected_auth_hdr) != 0) {
+        httpd_resp_set_status(req, "401 Unauthorized");
+        httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32\"");
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
+        return false;
+    }
+    return true;
+}
+
 void initSharedBuffer() {
     PB.mutex     = xSemaphoreCreateMutex();
     s_bbox_mutex = xSemaphoreCreateMutex();
+    initHttpAuth();
 }
 
 void initStatInfo() {
@@ -1114,6 +1170,9 @@ static int ra_filter_run(ra_filter_t* filter, int value) {
 #endif
 
 static esp_err_t results_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     esp_err_t        res     = ESP_OK;
     static uint64_t  last_id = 0;
     static char*     rst_buf = NULL;
@@ -1292,6 +1351,9 @@ static bool client_gone(httpd_req_t* req) {
  * fetchFramedMessages(). Sends every not-yet-sent AUDIO slot in order -
  * dropping PCM chunks would leave audible gaps downstream. */
 static esp_err_t stream_audio_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     esp_err_t res     = ESP_OK;
     size_t    last_id = 0;
 
@@ -1370,6 +1432,9 @@ static esp_err_t stream_audio_handler(httpd_req_t* req) {
 }
 
 static esp_err_t stream_result_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     esp_err_t        res     = ESP_OK;
     static uint64_t  last_id = 0;
 
@@ -1645,6 +1710,9 @@ static void sendBreakBestEffort() {
 }
 
 static esp_err_t command_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     char* buf = NULL;
 
     if (parse_get(req, &buf) != ESP_OK) {
@@ -1757,6 +1825,9 @@ static void query_param(httpd_req_t* req, const char* key, char* out, size_t out
  * waste of UART bandwidth and (until EVENT_POOL_SLOT_CAP was shrunk to
  * match, see its own comment) precious pool memory too. */
 static esp_err_t camera_start_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     char resolution[16], mode[16], differed[16];
     query_param(req, "resolution", resolution, sizeof(resolution), "2");
     query_param(req, "mode", mode, sizeof(mode), "invoke");
@@ -1801,6 +1872,9 @@ static esp_err_t camera_start_handler(httpd_req_t* req) {
  * Same universal stop the WE2 uses for audio too (see audio_stop_handler's
  * comment) - there's no separate "just the camera" stop on that side. */
 static esp_err_t camera_stop_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     static const char body[] = "BREAK";
     char               cmd_tag_buf[32] = {0};
     auto               slot = sendTaggedCommand(body, strlen(body), cmd_tag_buf, sizeof(cmd_tag_buf));
@@ -1820,6 +1894,9 @@ static esp_err_t camera_stop_handler(httpd_req_t* req) {
  * the audio stream itself (no browser playback - control only, per
  * explicit direction), it just starts/stops/configures it on the WE2. */
 static esp_err_t audio_start_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     char rate_str[16];
     query_param(req, "rate", rate_str, sizeof(rate_str), "16000");
     int rate = atoi(rate_str);
@@ -1859,6 +1936,9 @@ static esp_err_t audio_start_handler(httpd_req_t* req) {
  * API symmetry - calling it also stops any running camera stream, same as
  * camera_stop_handler. Not a bug, a WE2-side protocol constraint. */
 static esp_err_t audio_stop_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
     static const char body[] = "BREAK";
     char               cmd_tag_buf[32] = {0};
     auto               slot = sendTaggedCommand(body, strlen(body), cmd_tag_buf, sizeof(cmd_tag_buf));
