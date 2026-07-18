@@ -16,11 +16,23 @@ Endpoints used (all against --host, default port 80 unless noted):
     GET /camera/stop
     GET /audio/start?rate=16000|32000
     GET /audio/stop
-    GET :8081/stream/result        - AI inference (bbox) results, one JSON
-                                      line per detection batch, streamed
-                                      continuously while camera is running
-    GET :8082/stream/audio         - raw framed PCM audio, streamed
-                                      continuously while audio is running
+    GET :8081/stream/data          - MERGED stream (2026-07-18, replaces the
+                                      former separate :8081/stream/result +
+                                      :8082/stream/audio): AI inference
+                                      (bbox) JSON lines AND raw framed PCM
+                                      audio interleaved over one connection.
+                                      This client demuxes them itself - see
+                                      read_data_stream(). Root cause for the
+                                      merge: opening two brand-new streaming
+                                      connections at the same instant spiked
+                                      the ESP32's heap sharply enough to
+                                      collapse its WiFi/httpd stack under
+                                      repeated combined camera+audio cycling
+                                      (see esp32_camera_web_server_bridge
+                                      memory, 2026-07-18 section) - one
+                                      connection instead of two removes the
+                                      trigger entirely rather than just
+                                      timing around it.
     GET /result                    - one-shot: just the single newest bbox
                                       batch (not used by this client's main
                                       capture loop, but exposed via `once`
@@ -45,24 +57,26 @@ assuming an auth or firmware problem.
 
 Output layout (under --outdir):
     results.jsonl                 - one JSON line per AI inference (bbox)
-                                     batch received from /stream/result
+                                     batch, demuxed from /stream/data
     audio.wav                     - single continuous file, all audio
-                                     frames concatenated in arrival order
+                                     frames demuxed from /stream/data,
+                                     concatenated in arrival order
     media_client.pid              - present while a capture is running
     media_client.log              - background process's own log
 
 This client does not retry or attempt to recover dropped frames/bytes on a
 mid-stream network hiccup - it reconnects and keeps going, logging what it
-saw. It also does not retry a stalled /stream/result connection instantly:
+saw. It also does not retry a stalled /stream/data connection instantly:
 the ESP32 itself intentionally closes that connection after ~10s with zero
-new detections (a deliberate idle-timeout backstop on its side) - this
-client treats that the same as any other drop and just reconnects.
+new bbox/audio activity (a deliberate idle-timeout backstop on its side) -
+this client treats that the same as any other drop and just reconnects.
 """
 import argparse
 import base64
 import json
 import os
 import signal
+import socket
 import struct
 import sys
 import threading
@@ -108,29 +122,95 @@ def log_file(outdir):
     return os.path.join(outdir, "media_client.log")
 
 
+# 2026-07-19: table-driven (was a pure-Python bit-loop, ~8 inner iterations
+# per byte) - at up to 8000 bytes/audio frame that loop measured ~60ms on
+# this Orange Pi's CPU (benchmarked directly), easily enough to make THIS
+# SCRIPT the "slow client" from the ESP32's perspective under any load -
+# not real WiFi conditions. Same bug independently found and fixed in the
+# session scratchpad's coverage_test.py/matrix11.py; a stale memory note
+# claimed this file was already fixed for it - it wasn't, the actual code
+# still had the bit-loop. Table-driven is ~6x faster, mathematically
+# identical output.
+_CRC16_TABLE = []
+for _i in range(256):
+    _crc = _i
+    for _ in range(8):
+        _crc = (_crc >> 1) ^ 0xA001 if (_crc & 1) else (_crc >> 1)
+    _CRC16_TABLE.append(_crc)
+
+
 def crc16_maxim(data):
     crc = 0x0000
     for b in data:
-        crc ^= b
-        for _ in range(8):
-            crc = (crc >> 1) ^ 0xA001 if (crc & 1) else (crc >> 1)
+        crc = (crc >> 8) ^ _CRC16_TABLE[(crc ^ b) & 0xFF]
     return crc ^ 0xFFFF
 
 
+def _graceful_close_response(resp):
+    """Drain any buffered-but-unread bytes and shutdown(SHUT_RDWR) before the
+    caller's `with` block runs resp's own close() - see read_data_stream()'s
+    own call site comment for why this matters. Reaches into urllib's
+    internals (resp.fp.raw._sock) to get the underlying socket for the
+    shutdown() call - urllib itself exposes no public API for this, so this
+    is best-effort: if a future Python version changes that internal shape,
+    this just falls back to draining (still real, still worth doing) without
+    the explicit shutdown() call."""
+    try:
+        sock = resp.fp.raw._sock
+    except AttributeError:
+        sock = None
+    if sock is not None:
+        try:
+            sock.settimeout(0.3)
+        except OSError:
+            pass
+    # Overall deadline, not a per-read one - the server never stops sending
+    # on its own just because we're about to leave, so a per-read timeout
+    # alone would never fire as long as new data keeps arriving within each
+    # window (same bug/fix already found the hard way in this session's
+    # scratchpad coverage_test.py).
+    drain_deadline = time.time() + 1.0
+    while time.time() < drain_deadline:
+        try:
+            chunk = resp.read(65536)
+        except Exception:
+            break
+        if not chunk:
+            break
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------------------
-# Stream readers (each runs in its own thread inside the background process)
+# Stream reader (single thread inside the background process)
 # ---------------------------------------------------------------------------
 
-def read_bbox_stream(base, results_path, stop_event):
-    """Pulls AI inference (bbox detection) results off :8081/stream/result -
-    a persistent, continuously-streamed connection (see
-    stream_result_handler() in app_httpd.cpp), one JSON line (\\r\\n
-    terminated) per detection batch. Reconnects on any read error, or when
-    the server itself closes the connection after ~10s of no new detections
-    (its own deliberate idle-timeout backstop, not an error)."""
+def read_data_stream(base, results_path, wav_path, stop_event):
+    """Pulls the MERGED stream off :8081/stream/data (see
+    stream_data_handler() in app_httpd.cpp, 2026-07-18 - replaces what used
+    to be two separate connections/threads, one per :8081/stream/result and
+    :8082/stream/audio). Demuxes each message off the front of the buffer
+    exactly the way the ESP32's own fetchFramedMessages() demuxes WE2's
+    UART1 bytes: if it starts with the audio magic (0xFF 'S' 'M' 'B'), it's
+    a framed PCM audio frame (header + payload + CRC16); otherwise it's a
+    '\\n'-terminated bbox JSON line. These can never collide - buildInvokeJson()
+    on the firmware side always starts a JSON line with '{' (0x7B), never
+    0xFF. CRC mismatches on audio are logged but not fatal, just dropped.
+    Reconnects on any read error, or when the server itself closes the
+    connection after ~10s of no new bbox/audio activity (its own deliberate
+    idle-timeout backstop, not an error)."""
     url = base.replace(":80", ":8081") if ":80" in base else base + ":8081"
-    url += "/stream/result"
-    count = 0
+    url += "/stream/data"
+
+    wav_writer = None
+    wav_rate = None
+    frame_count = 0
+    crc_bad = 0
+    bbox_count = 0
+
     with open(results_path, "a") as out:
         while not stop_event.is_set():
             try:
@@ -142,92 +222,79 @@ def read_bbox_stream(base, results_path, stop_event):
                         if not chunk:
                             break
                         buf += chunk
-                        idx = buf.find(b"\n")
-                        while idx >= 0:
-                            line = buf[:idx].decode("utf-8", "replace").strip()
-                            buf = buf[idx + 1:]
-                            if line:
-                                try:
-                                    entry = json.loads(line)
-                                    entry["_client_ts_ms"] = int(time.time() * 1000)
-                                    out.write(json.dumps(entry) + "\n")
-                                    out.flush()
-                                    count += 1
-                                except json.JSONDecodeError as e:
-                                    log(f"bbox reader: malformed line dropped ({e}): {line[:120]!r}")
-                            idx = buf.find(b"\n")
+                        while True:
+                            if len(buf) < 4:
+                                break  # not enough to tell audio-magic from a JSON line's '{' yet
+                            if buf[:4] == AUDIO_MAGIC:
+                                if len(buf) < AUDIO_HEADER_LEN:
+                                    break
+                                rate, plen = struct.unpack_from("<II", buf, 4)
+                                channels, bits = buf[12], buf[13]
+                                total = AUDIO_HEADER_LEN + plen + AUDIO_CRC_LEN
+                                if len(buf) < total:
+                                    break
+                                payload = buf[AUDIO_HEADER_LEN:AUDIO_HEADER_LEN + plen]
+                                crc_recv = struct.unpack_from("<H", buf, AUDIO_HEADER_LEN + plen)[0]
+                                if crc16_maxim(payload) != crc_recv:
+                                    crc_bad += 1
+                                else:
+                                    if wav_writer is None:
+                                        wav_writer = wave.open(wav_path, "wb")
+                                        wav_writer.setnchannels(channels or 1)
+                                        wav_writer.setsampwidth((bits or 16) // 8)
+                                        wav_writer.setframerate(rate)
+                                        wav_rate = rate
+                                    if rate != wav_rate:
+                                        log(f"data reader: sample rate changed {wav_rate}->{rate} mid-stream, "
+                                            f"keeping {wav_rate} in the WAV header (rest of the file will play "
+                                            f"back at the wrong speed) - stop/restart the capture after AT+ASR "
+                                            f"changes")
+                                    wav_writer.writeframes(payload)
+                                    frame_count += 1
+                                buf = buf[total:]
+                            else:
+                                idx = buf.find(b"\n")
+                                if idx < 0:
+                                    if len(buf) > 65536:
+                                        # not audio-magic and no line terminator found in 64KB -
+                                        # something's desynced (shouldn't happen with well-formed
+                                        # firmware output); drop the buffered garbage rather than
+                                        # growing it unboundedly.
+                                        log(f"data reader: {len(buf)} bytes buffered with no audio "
+                                            f"magic or line terminator - dropping and resyncing")
+                                        buf = b""
+                                    break
+                                line = buf[:idx].decode("utf-8", "replace").strip()
+                                buf = buf[idx + 1:]
+                                if line:
+                                    try:
+                                        entry = json.loads(line)
+                                        entry["_client_ts_ms"] = int(time.time() * 1000)
+                                        out.write(json.dumps(entry) + "\n")
+                                        out.flush()
+                                        bbox_count += 1
+                                    except json.JSONDecodeError as e:
+                                        log(f"data reader: malformed bbox line dropped ({e}): {line[:120]!r}")
+                    # 2026-07-19: drain before the `with` block's own close()
+                    # runs - see _graceful_close_response()'s own comment.
+                    # Reached whenever the inner loop above exits for any
+                    # reason (stop_event set, or the server itself closed
+                    # the connection) - in the stop_event case specifically,
+                    # the server is almost certainly still actively
+                    # streaming (it has no idea we're about to leave), so
+                    # there's very likely unread data sitting in the OS
+                    # receive buffer right now; closing on top of that sends
+                    # an abortive RST instead of a clean FIN.
+                    _graceful_close_response(resp)
             except Exception as e:
                 if not stop_event.is_set():
-                    log(f"stream/result reader: {e} - reconnecting")
-                    time.sleep(1)
-    log(f"bbox reader stopped, {count} detection batches saved")
-
-
-def read_audio_stream(base, wav_path, stop_event):
-    """Pulls raw binary frames off :8082/stream/audio (see MSG_TYPE_AUDIO /
-    stream_audio_handler()), unwraps WE2's own framing (0xFF 'S' 'M' 'B' +
-    header + PCM + CRC16 - crc mismatches are logged but not treated as
-    fatal, just dropped), and appends the PCM into one continuous WAV file
-    for the whole capture session."""
-    url = base.replace(":80", ":8082") if ":80" in base else base + ":8082"
-    url += "/stream/audio"
-
-    wav_writer = None
-    wav_rate = None
-    frame_count = 0
-    crc_bad = 0
-
-    while not stop_event.is_set():
-        try:
-            req = urllib.request.Request(url, headers={"Authorization": auth_header()})
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                buf = b""
-                while not stop_event.is_set():
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while True:
-                        idx = buf.find(AUDIO_MAGIC)
-                        if idx < 0:
-                            if len(buf) > 4:
-                                buf = buf[-4:]
-                            break
-                        if idx > 0:
-                            buf = buf[idx:]
-                        if len(buf) < AUDIO_HEADER_LEN:
-                            break
-                        rate, plen = struct.unpack_from("<II", buf, 4)
-                        channels, bits = buf[12], buf[13]
-                        total = AUDIO_HEADER_LEN + plen + AUDIO_CRC_LEN
-                        if len(buf) < total:
-                            break
-                        payload = buf[AUDIO_HEADER_LEN:AUDIO_HEADER_LEN + plen]
-                        crc_recv = struct.unpack_from("<H", buf, AUDIO_HEADER_LEN + plen)[0]
-                        if crc16_maxim(payload) != crc_recv:
-                            crc_bad += 1
-                        else:
-                            if wav_writer is None:
-                                wav_writer = wave.open(wav_path, "wb")
-                                wav_writer.setnchannels(channels or 1)
-                                wav_writer.setsampwidth((bits or 16) // 8)
-                                wav_writer.setframerate(rate)
-                                wav_rate = rate
-                            if rate != wav_rate:
-                                log(f"audio reader: sample rate changed {wav_rate}->{rate} mid-stream, "
-                                    f"keeping {wav_rate} in the WAV header (rest of the file will play back "
-                                    f"at the wrong speed) - stop/restart the capture after AT+ASR changes")
-                            wav_writer.writeframes(payload)
-                            frame_count += 1
-                        buf = buf[total:]
-        except Exception as e:
-            if not stop_event.is_set():
-                log(f"stream/audio reader: {e} - reconnecting in 3s")
-                time.sleep(3)
+                    log(f"stream/data reader: {e} - reconnecting in 2s")
+                    time.sleep(2)
 
     if wav_writer is not None:
         wav_writer.close()
-    log(f"audio reader stopped, {frame_count} frames written, {crc_bad} CRC mismatches dropped")
+    log(f"data reader stopped, {bbox_count} detection batches + {frame_count} audio frames saved, "
+        f"{crc_bad} CRC mismatches dropped")
 
 
 # ---------------------------------------------------------------------------
@@ -266,15 +333,22 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
                     time.sleep(delay)
         raise RuntimeError(f"giving up on {url} after {attempts} attempts: {last_err}")
 
-    threads = []
+    # Control-plane starts stay sequential (camera then audio) - the ESP32
+    # side serializes AT-command sends across a single mutex regardless
+    # (see app_httpd.cpp's s_cmd_mutex), so firing these concurrently from
+    # two client threads would only queue up there, not actually save time.
     if want_camera:
         log(f"starting camera / AI inference (resolution={resolution})")
         start_with_retries(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0")
-        threads.append(threading.Thread(target=read_bbox_stream, args=(base, results_path, stop_event)))
     if want_audio:
         log(f"starting audio (rate={rate})")
         start_with_retries(base + f"/audio/start?rate={rate}")
-        threads.append(threading.Thread(target=read_audio_stream, args=(base, wav_path, stop_event)))
+
+    # 2026-07-18: ONE reader thread/connection now regardless of want_camera/
+    # want_audio - see read_data_stream()'s own comment. It simply won't see
+    # bbox lines if camera was never started, or audio frames if audio
+    # wasn't, so this is correct for any combination of the two.
+    threads = [threading.Thread(target=read_data_stream, args=(base, results_path, wav_path, stop_event))]
 
     for t in threads:
         t.start()

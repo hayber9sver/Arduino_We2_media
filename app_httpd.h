@@ -7,4 +7,8 @@ enum Proto {
     PROTO_SPI  = 3,
 };
 
+// 2026-07-17: additional I2C command channel used alongside PROTO_UART -
+// see app_httpd.cpp's own comment above its definition.
+void initI2CCommandChannel();
+
 #endif

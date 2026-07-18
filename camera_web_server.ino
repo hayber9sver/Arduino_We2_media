@@ -52,6 +52,7 @@ void setup() {
     Serial.println("WiFi connected");
 
     startRemoteProxy(PROTO_UART);
+    initI2CCommandChannel();
     startCameraServer();
 
     Serial.print("Camera Ready! Use 'http://");

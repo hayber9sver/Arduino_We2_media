@@ -46,7 +46,10 @@
     #include <esp32-hal-log.h>
 #endif
 
-#define RESULT_TIMEOUT_MS 3000
+// 2026-07-17: was 3000 - see CMD_TAG_FMT_STR's comment for the hardware
+// evidence (genuine replies arriving a few hundred ms late, repeatedly)
+// that motivated this bump. 8000 comfortably covers that margin.
+#define RESULT_TIMEOUT_MS 8000
 #define CMD_TIMEOUT_MS    3000
 
 // 2026-07-11: was two branches (ESP32S3 vs everything else, selected via
@@ -68,7 +71,7 @@
 // resp copy...") mid-stream, and every command after that point timed
 // out because proxyCallback() was silently dropping everything, not just
 // evicting it. Back to 3; the actual eviction-race fix now lives in
-// proxyCallback()/sendTaggedCommand() (s_awaited_tag) instead of trying
+// proxyCallback()/ggedCommand() (s_awaited_tag) instead of trying
 // to buy headroom with a bigger ring.
 #define PTR_BUFFER_SIZE     3
 #define COM_BUFFER_SIZE     (1024 * 32)
@@ -86,17 +89,22 @@
 // is 16 bytes deep and out_transport.c currently polls it, not
 // interrupt-driven - see out_transport.c/sscma_cam_mic.c's audio_task for
 // the other half of this mitigation). The literal "HTTPD" added nothing to
-// uniqueness (every tag started with it), so it's dropped entirely; 3 hex
-// digits (0-0xFFF, masked from the tick count - see the masking at the
-// snprintf call site in sendTaggedCommand()) wrap every ~4s, comfortably
-// longer than RESULT_TIMEOUT_MS (3s) so a late/lost reply's tag can't get
-// confused with a fresh request's. This shrinks the tag from 14 to 4 bytes,
-// so short queries like "SENSOR?"/"ACTION?" now total 16 bytes or under and
-// should no longer be truncated - longer bodies (e.g. "SENSOR=1,1,0", or
-// anything relayed through /command's base64 passthrough) can still exceed
-// 16 bytes on their own and remain at risk until the WE2 side gets a real
-// interrupt/DMA-driven RX path.
-#define CMD_TAG_FMT_STR "%.3X@"
+// uniqueness (every tag started with it), so it's dropped entirely.
+//
+// 2026-07-17: widened 3 hex digits -> 4 (12 bits -> 16 bits, wraps every
+// ~4s -> ~65s) alongside bumping RESULT_TIMEOUT_MS 3000 -> 8000 - the old
+// 3-digit tag's ~4s wrap was no longer "comfortably longer" than the new
+// 8s timeout (it'd wrap mid-wait, risking exactly the late-reply/fresh-
+// request tag collision this comment used to warn about). Hardware
+// evidence motivating the RESULT_TIMEOUT_MS bump: `sendTaggedCommand()`'s
+// own diagnostic logging (see its consecutive-timeout branch) showed
+// genuine UART1 traffic arriving a few hundred ms before each 3s timeout
+// fired, repeatedly, for the same in-flight command - consistent with the
+// real reply arriving just after the old deadline rather than never at
+// all. Costs one more tag byte (5 total vs 4), so short queries now need
+// 17 bytes or under to stay inside the 16-byte DW_UART RX FIFO in one
+// burst - longer bodies were already at risk of this either way.
+#define CMD_TAG_FMT_STR "%.4X@"
 #define CMD_TAG_SIZE    snprintf(NULL, 0, CMD_TAG_FMT_STR, 0)
 
 #define MSG_REPLY_STR   "\"type\": 0"
@@ -126,6 +134,33 @@ enum CmdType : uint16_t {
     CMD_TYPE_SENSOR  = 0xff00 & (3 << 8),
 };
 
+// 2026-07-18: TEMP DIAGNOSTIC - `free`/`largest` alone can't distinguish
+// "genuine leak" (total free shrinking) from "fragmentation" (total free
+// roughly stable but largest contiguous block collapsing while allocated
+// block *count* climbs). heap_caps_get_info() gives the full multi_heap_info_t
+// breakdown (allocated_blocks, free_blocks, total_allocated_bytes,
+// minimum_free_bytes) in one call - logging all of it at the same points
+// the existing free/largest DBG lines already fire, so the two can be
+// correlated against the same timeline. Remove once the fragmentation
+// source is found.
+static void dbg_log_heap_info(const char* tag) {
+    multi_heap_info_t info;
+    heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+    log_w("DBG heap_info[%s]: free=%u largest=%u min_ever_free=%u "
+          "alloc_blocks=%u free_blocks=%u total_alloc_bytes=%u",
+          tag, (unsigned)info.total_free_bytes, (unsigned)info.largest_free_block,
+          (unsigned)info.minimum_free_bytes, (unsigned)info.allocated_blocks,
+          (unsigned)info.free_blocks, (unsigned)info.total_allocated_bytes);
+}
+
+// Forward declaration - full definition lives further down this file,
+// after slot_pool_release()/audio_pool_release() (which SlotRef's
+// destructor needs). std::deque tolerates an incomplete element type at
+// the point of member declaration (only needs to be complete by the time
+// any deque member function is actually instantiated, which happens much
+// later in this file, well after SlotRef's real definition).
+class SlotRef;
+
 struct PtrBuffer {
     struct Slot {
         size_t   id       = 0;
@@ -141,12 +176,22 @@ struct PtrBuffer {
         // slot back to the pool instead - freeing pool memory would be
         // wrong (it's a static array, not a heap allocation).
         int pool_idx = -1;
+        // 2026-07-18: intrusive refcount for SlotRef (see its own comment,
+        // defined further down this file after slot_pool_release()) -
+        // replaces std::shared_ptr<Slot>, which allocated a separate
+        // control block on the heap on every single construction (every
+        // audio frame + every REPLY/LOGGI, the same high-frequency-small-
+        // alloc pattern that caused fragmentation before Slot itself and
+        // AUDIO's payload were moved onto fixed pools). Living inside the
+        // already-pooled Slot means refcounting this needs zero additional
+        // heap allocations.
+        std::atomic<int> refcount{0};
     };
 
-    SemaphoreHandle_t                 mutex;
-    std::deque<std::shared_ptr<Slot>> slots;
-    volatile size_t                   id    = 1;
-    const size_t                      limit = PTR_BUFFER_SIZE;
+    SemaphoreHandle_t          mutex;
+    std::deque<SlotRef>        slots;
+    volatile size_t            id    = 1;
+    const size_t               limit = PTR_BUFFER_SIZE;
 };
 
 struct StatInfo {
@@ -201,6 +246,30 @@ static size_t             s_bbox_ring_next = 0;  // next write index (wraps) == 
 static uint64_t           s_bbox_next_id   = 1;
 static SemaphoreHandle_t  s_bbox_mutex;           // dedicated lock, separate from PB.mutex
 
+/* 2026-07-11: tracks whether any HTTP client is actively pulling EVENT
+ * (bbox) or AUDIO data right now. With nobody connected, retaining data
+ * nobody will ever read is pure waste - results_handler()'s one-shot
+ * GET /result only ever wants the single newest slot anyway, so it's
+ * unaffected by more aggressive eviction while this is 0.
+ *
+ * 2026-07-18: was two separate counters (s_event_stream_clients/
+ * s_audio_stream_clients), one per streaming httpd instance/worker task,
+ * from the brief period this file had `/stream/result` and `/stream/audio`
+ * as two independent long-lived connections - merged into one
+ * `/stream/data` endpoint (stream_data_handler()) carrying both AUDIO and
+ * EVENT/bbox traffic over a single connection/worker/accept(). One
+ * connection, one counter. Declared up here (rather than near where the
+ * rest of this file's globals cluster, further down) specifically so
+ * pushBboxEvent() below - which runs on loopTask, upstream of any
+ * WiFi/httpd-side buffering - can gate on it too (see that function's own
+ * 2026-07-18 comment on why: an un-gated bbox ring kept accumulating a
+ * detection backlog while nobody was connected, which a fresh connect then
+ * had to burst-flush all at once - a real, measured contributor to the
+ * connect-time heap spike this session spent a long time chasing, per
+ * user's diagnosis: nothing should accumulate for a connection nobody has
+ * open yet). */
+static std::atomic<int> s_data_stream_clients{0};
+
 /* Parses `"boxes": [[x, y, w, h, score, target], ...]` out of one WE2
  * INVOKE/SAMPLE EVENT JSON message and pushes each box tuple as its own
  * ring entry, all sharing one timestamp (this message's arrival time).
@@ -210,11 +279,37 @@ static SemaphoreHandle_t  s_bbox_mutex;           // dedicated lock, separate fr
  * so no cross-writer protection is needed beyond the mutex readers also
  * take. */
 static void pushBboxEvent(const char* resp, size_t len) {
+    // TEMP DIAGNOSTIC (2026-07-17): investigating a "No route to host" WiFi
+    // drop specifically correlated with camera activity, ~35-55s into a
+    // run - checking whether a genuine heap leak/growth (as opposed to a
+    // power-supply brownout) is the real cause. pushBboxEvent() is the one
+    // thing that runs once per camera detection and previously had zero
+    // heap visibility (unlike pushPBSlot(), which already logs heap every
+    // 2s for REPLY/AUDIO traffic). Remove once this is resolved either way.
+    {
+        static uint32_t s_dbg_last_heap_log_ms = 0;
+        uint32_t        now_ms                 = millis();
+        if (now_ms - s_dbg_last_heap_log_ms >= 2000) {
+            s_dbg_last_heap_log_ms = now_ms;
+            dbg_log_heap_info("pushBboxEvent");
+        }
+    }
     static const char BOXES_KEY[] = "\"boxes\": [";
     const char*        p          = strnstr(resp, BOXES_KEY, len);
     if (p == NULL) {
         return;
     }
+
+    // 2026-07-18: see s_data_stream_clients' own comment above - with
+    // nobody connected to /stream/data right now, don't bother storing
+    // detections nobody will ever read. Mirrors pushPBSlot()'s AUDIO
+    // has_consumer gating (same rationale, same fix pattern) - a fresh
+    // connect should start clean instead of immediately having to
+    // burst-flush whatever accumulated in the ring while it was gone.
+    if (s_data_stream_clients <= 0) {
+        return;
+    }
+
     const char* end = resp + len;
     p += strlen(BOXES_KEY);
 
@@ -420,6 +515,133 @@ static void audio_pool_release(int idx) {
     }
 }
 
+/* 2026-07-18: fixed pool for the `PtrBuffer::Slot` metadata struct itself -
+ * the one remaining `malloc()`/`free()` in pushPBSlot()'s hot path (see
+ * this function's own comment: it used to be flagged as a candidate for
+ * the combined-camera+audio-only heap collapse this session was chasing).
+ * Every single push - EVERY audio frame (~every 125-250ms while streaming,
+ * even though the frame's PAYLOAD already lives in the fixed s_audio_pool
+ * above) plus every REPLY/LOGGI - mallocs and frees one of these. Measured
+ * directly on hardware this session: `heap_caps_get_largest_free_block()`
+ * trended steadily DOWNWARD across repeated combined camera+audio
+ * connect/disconnect cycles even though `heap_caps_get_free_size()` (total
+ * free bytes) recovered fully after each cycle - the signature of
+ * fragmentation, not a leak of total bytes. Isolated audio-only/camera-only
+ * runs (see esp32_camera_web_server_bridge memory, 2026-07-18 bisection)
+ * never showed this because each alone has only ONE traffic pattern's worth
+ * of alloc sizes cycling through the heap; combined load interleaves this
+ * struct's fixed-size churn with REPLY/LOGGI's *variable*-size mallocs
+ * (`pushPBSlot()`'s `malloc(len)` below) at a much higher combined rate,
+ * which is exactly the kind of mixed-size churn that defeats a
+ * general-purpose allocator's coalescing. Moving this struct itself onto a
+ * fixed pool (same pattern already proven for AUDIO_POOL/EVENT_POOL above)
+ * removes it from the equation entirely - it can no longer contribute
+ * fragmentation regardless of push rate or interleaving pattern.
+ * Sized generously beyond PB.limit (PTR_BUFFER_SIZE=3): a slot erased from
+ * PB.slots can stay alive a little longer via an outstanding shared_ptr
+ * copy held by sendTaggedCommand()'s or a stream handler's own local
+ * snapshot, so more than `limit` instances can technically be live for a
+ * brief moment. */
+#define SLOT_POOL_SIZE 8
+static PtrBuffer::Slot   s_slot_pool[SLOT_POOL_SIZE];
+static std::atomic<bool> s_slot_pool_used[SLOT_POOL_SIZE] = {false};
+
+static PtrBuffer::Slot* slot_pool_acquire() {
+    for (int i = 0; i < SLOT_POOL_SIZE; ++i) {
+        bool expected = false;
+        if (s_slot_pool_used[i].compare_exchange_strong(expected, true)) {
+            return &s_slot_pool[i];
+        }
+    }
+    return nullptr;
+}
+
+static void slot_pool_release(PtrBuffer::Slot* p) {
+    int idx = (int)(p - s_slot_pool);
+    if (idx >= 0 && idx < SLOT_POOL_SIZE) {
+        s_slot_pool_used[idx] = false;
+    }
+}
+
+/* 2026-07-18: intrusive-refcount replacement for std::shared_ptr<Slot> -
+ * see PtrBuffer::Slot::refcount's own comment for why (std::shared_ptr's
+ * pointer+deleter constructor always heap-allocates a separate control
+ * block, once per construction - a high-frequency small allocation this
+ * file had already root-caused and fixed for the Slot struct itself and
+ * AUDIO's payload buffer, but missed for the shared_ptr wrapping them).
+ * Storing the refcount inside the already-pooled Slot means this needs
+ * zero heap allocations of its own. Deliberately mimics only the subset
+ * of shared_ptr's interface this file actually uses (op->, op*, op bool,
+ * .get(), .reset(), copy/move, == nullptr) so every call site only needed
+ * its TYPE changed, not its logic. */
+class SlotRef {
+public:
+    SlotRef() : p_(nullptr) {}
+    explicit SlotRef(PtrBuffer::Slot* p) : p_(p) {
+        if (p_) {
+            p_->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    SlotRef(const SlotRef& other) : p_(other.p_) {
+        if (p_) {
+            p_->refcount.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    SlotRef(SlotRef&& other) noexcept : p_(other.p_) {
+        other.p_ = nullptr;
+    }
+    SlotRef& operator=(const SlotRef& other) {
+        if (this != &other) {
+            release();
+            p_ = other.p_;
+            if (p_) {
+                p_->refcount.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return *this;
+    }
+    SlotRef& operator=(SlotRef&& other) noexcept {
+        if (this != &other) {
+            release();
+            p_       = other.p_;
+            other.p_ = nullptr;
+        }
+        return *this;
+    }
+    ~SlotRef() { release(); }
+
+    void             reset() { release(); p_ = nullptr; }
+    PtrBuffer::Slot* get() const { return p_; }
+    PtrBuffer::Slot* operator->() const { return p_; }
+    PtrBuffer::Slot& operator*() const { return *p_; }
+    explicit operator bool() const { return p_ != nullptr; }
+    bool operator==(std::nullptr_t) const { return p_ == nullptr; }
+    bool operator!=(std::nullptr_t) const { return p_ != nullptr; }
+
+private:
+    // Releases this reference; once the last one goes, frees the payload
+    // (pool release for AUDIO, free() for REPLY/LOGGI - same split
+    // pushPBSlot() already established) and returns the Slot struct itself
+    // to s_slot_pool. Does NOT touch p_ - callers clear it themselves
+    // (reset()/assignment operators) since a couple of call sites need the
+    // old value gone before they can safely overwrite it.
+    void release() {
+        if (p_ && p_->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            if (p_->data != NULL) {
+                if (p_->pool_idx >= 0 && (p_->type & MSG_TYPE_AUDIO)) {
+                    audio_pool_release(p_->pool_idx);
+                } else {
+                    free(p_->data);
+                }
+                p_->data = NULL;
+            }
+            slot_pool_release(p_);
+        }
+    }
+
+    PtrBuffer::Slot* p_;
+};
+
 /* 2026-07-11: guards PB's oldest-first eviction (see proxyCallback()) from
  * discarding the one REPLY/LOGGI slot an in-flight sendTaggedCommand() is
  * actually waiting for. Confirmed on hardware: while INVOKE/ASAMPLE keep
@@ -428,38 +650,47 @@ static void audio_pool_release(int idx) {
  * bigger ring blow the chip's ~86KB heap), a REPLY sitting behind even a
  * couple of those EVENT slots got evicted before sendTaggedCommand()'s 5ms
  * polling loop ever saw it, so AT+BREAK/AT+ASR kept timing out even though
- * WE2 had genuinely already replied. Single string because this sketch's
- * httpd server is single-threaded (esp_http_server serializes handlers on
- * one task per instance), so only one tag is ever actually in flight from
- * sendTaggedCommand() at a time - always read/written under PB.mutex, same
- * as the slots themselves. */
+ * WE2 had genuinely already replied.
+ *
+ * 2026-07-18: the "single string because single-threaded" reasoning this
+ * comment used to give is WRONG and was already contradicted by
+ * s_event_stream_clients/s_audio_stream_clients's own comment just below -
+ * once result_httpd/audio_httpd became separate instances (each with its
+ * own worker task), stream_result_handler() and stream_audio_handler() can
+ * each independently call disconnectStreamClient() -> sendBreakBestEffort()
+ * -> sendTaggedCommand() on their own task, genuinely concurrently with each
+ * other AND with web_httpd's task (camera/audio start/stop, /command). Root-
+ * caused as the actual explanation for "combined camera+audio load only"
+ * heap/connection collapse (camera-only and audio-only bisection each ran
+ * 15 clean cycles - see esp32_camera_web_server_bridge memory - because
+ * with only one stream ever active, only one task ever reaches this code at
+ * a time; only the combined case can have two tasks racing here). Two
+ * concurrent sendTaggedCommand() calls clobber this shared buffer AND
+ * interleave raw bytes on the single I2C Wire bus with no locking at all -
+ * s_cmd_mutex (declared right below) now serializes the whole function, so
+ * this really is single-writer again, just enforced instead of assumed. */
 static char s_awaited_tag[32] = {0};
 
-/* 2026-07-11: added alongside pushPBSlot()'s heap-aware eviction (see its
- * own comment) - tracks whether any HTTP client is actively pulling EVENT
- * (bbox, from stream_result_handler()) or AUDIO (from stream_audio_
- * handler()) slots right now. With nobody connected to a /stream/*
- * endpoint, retaining up to PTR_BUFFER_SIZE slots of real-world ~8KB
- * audio/bbox payloads is pure heap pressure for data nobody will ever read
- * - results_handler()'s one-shot GET /result only ever wants the single
- * newest slot anyway, so it's unaffected by more aggressive eviction while
- * these are 0.
- *
- * 2026-07-12: was `volatile int`, safe only because stream_result_handler()/
- * stream_audio_handler() used to share a single stream_httpd instance's one
- * worker task, serializing both writers against each other by construction.
- * Now that each runs on its own dedicated httpd instance (result_httpd/
- * audio_httpd - see startCameraServer()'s comment on why: the old
- * single-task setup could only ever serve ONE stream at a time, queuing the
- * other client's connection indefinitely, which doesn't work for one client
- * wanting both streams open together), that assumption no longer holds -
- * both writers can now genuinely run concurrently on different tasks.
- * `volatile` gives no atomicity guarantee for a read-modify-write like
- * `+= 1` (a torn increment under real concurrency could lose an update),
- * so this is std::atomic<int> now - same pattern already used for
- * s_event_pool_used[] earlier this session for the same underlying reason. */
-static std::atomic<int> s_event_stream_clients{0};
-static std::atomic<int> s_audio_stream_clients{0};
+/* 2026-07-18: see s_awaited_tag's comment above - serializes the entire
+ * body of sendTaggedCommand() (tag bookkeeping + the raw Wire/I2C
+ * transmission + the reply-wait poll) across whichever task calls it, since
+ * independent httpd worker tasks (web_httpd; data_httpd via
+ * disconnectStreamClient()) can both legitimately call it. Plain
+ * (non-recursive) mutex - sendBreakBestEffort() takes and releases its OWN
+ * separate short critical section for its debounce check before calling
+ * sendTaggedCommand(), never while already holding this one, so there's no
+ * self-deadlock risk. */
+static SemaphoreHandle_t s_cmd_mutex;
+
+/* 2026-07-18: minimal RAII wrapper so sendTaggedCommand()'s several early
+ * return points (timeout, success) can't accidentally leak s_cmd_mutex held -
+ * matches this file's existing preference for RAII (std::shared_ptr,
+ * std::atomic) over manual accounting. */
+struct MutexGuard {
+    SemaphoreHandle_t m;
+    explicit MutexGuard(SemaphoreHandle_t m_) : m(m_) { xSemaphoreTake(m, portMAX_DELAY); }
+    ~MutexGuard() { xSemaphoreGive(m); }
+};
 
 StatInfo  SI;
 SSCMA     AI;
@@ -499,8 +730,52 @@ static uint32_t s_consecutive_at_timeouts = 0;
  * reboot of both boards ever recovered a wedged link; either board
  * rebooting alone did not. This threshold - N consecutive AT reply
  * timeouts - is the trigger to assume that's what happened and re-arm the
- * probe handshake automatically instead of requiring a manual ESP32 reboot. */
+ * probe handshake automatically instead of requiring a manual ESP32 reboot.
+ *
+ * 2026-07-17: N-consecutive-timeouts alone turned out to fire falsely under
+ * sustained camera+audio streaming - confirmed via dual WE2+ESP32 console
+ * capture: WE2 was still very much alive and still sending real UART1
+ * traffic (bbox JSON, audio frames), but a single AT reply (e.g. BREAK from
+ * sendBreakBestEffort()) got queued behind that continuous ~8018B-frame
+ * traffic on the same wire often enough to miss RESULT_TIMEOUT_MS (3s) two
+ * times in a row purely from congestion, with WE2 never actually rebooting.
+ * That falsely tripped this resync path mid-stream, which drops
+ * s_fetch_len (below) and forces pollWe2Uart1Handshake() to wait for a probe
+ * WE2's own out_transport.c will in fact never send again post-switch (it's
+ * a one-way switch - see esp32_camera_web_server_bridge memory) - the false
+ * trip itself was the real cause of the ~13-16s stream_audio_handler/
+ * stream_result_handler reconnect cycle this was meant to explain. See
+ * s_last_uart1_rx_ms below - the resync trigger now also requires genuine
+ * UART1 silence, not just one tagged reply going missing. */
 #define WE2_RESYNC_TIMEOUT_THRESHOLD (2)
+/* Only actually treat consecutive tagged-reply timeouts as evidence of a
+ * real WE2 reboot if UART1 has ALSO been completely silent for this long -
+ * real traffic (any byte at all, tracked in fetchFramedMessages()) is proof
+ * WE2 is still alive and still on UART1, no matter how backed up the one
+ * specific reply sendTaggedCommand() is waiting for might be. Comfortably
+ * longer than RESULT_TIMEOUT_MS x WE2_RESYNC_TIMEOUT_THRESHOLD so a
+ * congestion-only false positive (traffic still flowing, just not that one
+ * reply) never trips this, while an actual reboot (UART1 goes fully dead)
+ * still gets caught quickly.
+ *
+ * 2026-07-17: bumped 5000 -> 20000 alongside RESULT_TIMEOUT_MS's 3000->8000
+ * bump - needs to stay above RESULT_TIMEOUT_MS x WE2_RESYNC_TIMEOUT_THRESHOLD
+ * (now 8000 x 2 = 16000), and the old 5000 no longer cleared that bar on its
+ * own (it was already less than one single new-length timeout). */
+#define WE2_RESYNC_SILENCE_MS (20000)
+/* Absolute safety valve, independent of the silence check above - hardware-
+ * confirmed 2026-07-17: a sustained-audio-load scenario where UART1 traffic
+ * (real audio/bbox bytes) kept trickling in but the AT+BREAK reply
+ * specifically never arrived, indefinitely (s_consecutive_at_timeouts
+ * climbed past 15 with zero recovery), left the board needing a manual
+ * ESP32 hard reset to unstick - the silence-gated check alone has no upper
+ * bound on how long it'll keep trusting "still alive" over "actually do
+ * something about it". This ceiling forces a resync attempt regardless of
+ * recent traffic once things have clearly gone wrong for long enough that
+ * continuing to wait isn't a reasonable bet anymore, trading a (rare)
+ * unnecessary resync for never being stuck forever. */
+#define WE2_RESYNC_HARD_CEILING (8)
+static uint32_t s_last_uart1_rx_ms = 0;
 
 /* 2026-07-13: HTTP Basic Auth, required on every endpoint (control commands
  * AND the /stream/* and /result endpoints) - per explicit direction, change
@@ -560,6 +835,7 @@ static bool checkAuth(httpd_req_t* req) {
 void initSharedBuffer() {
     PB.mutex     = xSemaphoreCreateMutex();
     s_bbox_mutex = xSemaphoreCreateMutex();
+    s_cmd_mutex  = xSemaphoreCreateMutex();
     initHttpAuth();
 }
 
@@ -578,12 +854,12 @@ void startRemoteProxy(Proto through = PROTO_UART) {
         // a workaround is to modify uartBegin() in
         //     esp32/hardware/esp32/2.0.14/cores/esp32/esp32-hal-uart.c
         atSerial.setRxBufferSize(COM_BUFFER_SIZE);
-        // 2026-07-12: reverted to the real WE2 board's baud (default
-        // SSCMA_UART_BAUD = 921600) - was temporarily forced to 115200 to
-        // match Orange Pi's ttyS5 we2_sim.py simulator (its 24MHz UART
-        // clock can't hit an accurate 921600). Any audio-frame-rate numbers
-        // measured at 115200 (e.g. ~1 frame/s solo) were bandwidth-throttled
-        // by that test setup, not representative of real hardware.
+        // 2026-07-17: reverted to the real WE2 board's baud (default
+        // SSCMA_UART_BAUD = 921600) - the 115200 override was only ever for
+        // testing against an Orange Pi UART stand-in (see
+        // esp32_camera_web_server_bridge / orangepi_zero3_uart5_i2c3_probe
+        // memory - that whole approach was abandoned this session in favor
+        // of testing directly against real WE2 hardware).
         AI.begin(&atSerial, D3);
         s_uart_proto_active = true;
         break;
@@ -602,6 +878,39 @@ void startRemoteProxy(Proto through = PROTO_UART) {
     default:
         assert(false && "Unknown proto...");
     }
+}
+
+// 2026-07-17: WE2's I2C slave address (matches Seeed_Arduino_SSCMA.h's own
+// I2C_ADDRESS default, and the WE2-side i2c_cmd.c's I2C_CMD_SLV_ADDR -
+// EPII_CM55M_APP_S/app/scenario_app/sscma_cam_mic/i2c_cmd.c).
+#define WE2_I2C_CMD_ADDR (0x62)
+
+// Split-channel bring-up: commands go out over I2C (this function), replies/
+// results still arrive over UART exactly as before (atSerial, PROTO_UART
+// case above, untouched) - WE2-side i2c_cmd.c feeds whatever it receives
+// here into the exact same AT-command dispatcher UART commands go through,
+// so no reply-side change was needed there either. Separate from
+// startRemoteProxy()'s existing PROTO_I2C case, which routes *everything*
+// through Wire via the SSCMA library's own AI object - that case is
+// untouched/unused here, this is an additional path alongside PROTO_UART.
+void initI2CCommandChannel() {
+    // NOT COM_BUFFER_SIZE (32KB, sized for UART's much higher throughput) -
+    // this only ever carries a single short AT command string per
+    // transmission. 512 comfortably covers CMD_PREFIX+tag+body+CMD_SUFFIX
+    // for any command this sketch builds, with margin (WE2-side i2c_cmd.c's
+    // own receive buffer is 128 bytes). The 32KB request failed outright
+    // once WiFi/HTTP had already claimed most of the heap: "[E][Wire.cpp]
+    // allocateWireBuffer(): Can't allocate memory for I2C_0 txBuffer".
+    Wire.setBufferSize(512);
+    // 2026-07-17: moved off the default D4(SDA)/D5(SCL) - i2c_master_transmit
+    // kept failing with ESP_ERR_INVALID_STATE (bus not idle-high at transmit
+    // time) on D4/D5 even after checking pull-ups/GND against real WE2
+    // hardware, so trying a different ESP32 pin pair per user's direction.
+    // D0=GPIO2 is an ESP32-C3 strapping pin - fine here since this only
+    // matters during the boot/reset window, not during normal operation
+    // long after boot. WE2 side (i2c_cmd.c) is unchanged - still PA2/PA3 -
+    // only the physical wire's ESP32 endpoint moves, from D4/D5 to D0/D1.
+    Wire.begin(D0, D1);  // master mode, SDA=D0(GPIO2), SCL=D1(GPIO3)
 }
 
 inline uint16_t getMsgType(const char* resp, size_t len) {
@@ -662,7 +971,7 @@ static void pushPBSlot(uint16_t type, const void* data, size_t len) {
     // either, they default to has_consumer=true below.
     bool has_consumer = true;
     if (type & MSG_TYPE_AUDIO) {
-        has_consumer = (s_audio_stream_clients > 0);
+        has_consumer = (s_data_stream_clients > 0);
     }
     if (!has_consumer) {
         for (auto it = PB.slots.begin(); it != PB.slots.end();) {
@@ -714,7 +1023,7 @@ static void pushPBSlot(uint16_t type, const void* data, size_t len) {
         }
         while (audio_count >= AUDIO_RING_LIMIT) {
             auto victim = std::find_if(PB.slots.begin(), PB.slots.end(),
-                                        [](const std::shared_ptr<PtrBuffer::Slot>& s) {
+                                        [](const SlotRef& s) {
                                             return s->type == MSG_TYPE_AUDIO;
                                         });
             if (victim == PB.slots.end()) {
@@ -818,14 +1127,17 @@ static void pushPBSlot(uint16_t type, const void* data, size_t len) {
     // see this function's earlier comment on why. Same for this malloc().
     memcpy(copy, data, len);
 
-    PtrBuffer::Slot* p_slot = (PtrBuffer::Slot*)malloc(sizeof(PtrBuffer::Slot));
+    // 2026-07-18: was malloc(sizeof(PtrBuffer::Slot)) - see slot_pool_acquire()'s
+    // own comment for why this moved to a fixed pool.
+    PtrBuffer::Slot* p_slot = slot_pool_acquire();
     if (p_slot == NULL) {
         if (type & MSG_TYPE_AUDIO) {
             audio_pool_release(pool_i);
         } else {
             free(copy);
         }
-        log_e("pushPBSlot: failed to allocate slot...");
+        log_e("pushPBSlot: failed to allocate slot (SLOT_POOL_SIZE=%u exhausted)...",
+              (unsigned)SLOT_POOL_SIZE);
         return;
     }
 
@@ -841,25 +1153,16 @@ static void pushPBSlot(uint16_t type, const void* data, size_t len) {
     // happened outside the lock.
     xSemaphoreTake(PB.mutex, portMAX_DELAY);
     p_slot->id = PB.id;
-    PB.slots.emplace_back(std::shared_ptr<PtrBuffer::Slot>(p_slot, [](PtrBuffer::Slot* p) {
-        if (p == NULL) {
-            return;
-        }
-        if (p->data != NULL) {
-            // pool_idx >= 0 means `data` points into the fixed AUDIO pool,
-            // not the heap - release the slot back to it instead of
-            // free()ing static array memory (see PtrBuffer::Slot::pool_idx's
-            // comment). EVENT no longer flows through PB.slots at all (see
-            // pushBboxEvent()), so pool_idx >= 0 can only mean AUDIO here.
-            if (p->pool_idx >= 0 && (p->type & MSG_TYPE_AUDIO)) {
-                audio_pool_release(p->pool_idx);
-            } else {
-                free(p->data);
-            }
-            p->data = NULL;
-        }
-        free(p);
-    }));
+    // 2026-07-18: was a std::shared_ptr<PtrBuffer::Slot> built from a
+    // pointer+custom-deleter constructor, which heap-allocates a separate
+    // control block on every single call - see SlotRef's own comment
+    // (defined earlier in this file, right after slot_pool_release()) for
+    // why that was the last remaining high-frequency heap allocation in
+    // this hot path and how SlotRef avoids it (intrusive refcount living
+    // inside the already-pooled Slot itself). The cleanup logic that used
+    // to live in the shared_ptr's deleter lambda now lives in
+    // SlotRef::release().
+    PB.slots.emplace_back(SlotRef(p_slot));
     xSemaphoreGive(PB.mutex);
     PB.id += 1;
 
@@ -878,9 +1181,14 @@ static void pushPBSlot(uint16_t type, const void* data, size_t len) {
     if (discarded > 0 || heap_low || (now_ticks - s_last_heap_log) >= heap_log_interval) {
         s_last_heap_log = now_ticks;
         log_i("Received %u bytes (type=0x%04x), heap: free=%u largest=%u, "
-              "event_clients=%d audio_clients=%d, discarded=%u%s",
-              len, type, (unsigned)free_now, (unsigned)largest_now, s_event_stream_clients.load(),
-              s_audio_stream_clients.load(), discarded, heap_low ? " [LOW]" : "");
+              "data_clients=%d, discarded=%u%s",
+              len, type, (unsigned)free_now, (unsigned)largest_now, s_data_stream_clients.load(),
+              discarded, heap_low ? " [LOW]" : "");
+        // 2026-07-18: TEMP DIAGNOSTIC - alloc_blocks/free_blocks trend lets
+        // us tell "genuine leak" (alloc_blocks climbing over the whole run)
+        // apart from "fragmentation spike" (alloc_blocks flat, largest still
+        // collapses) - see dbg_log_heap_info()'s own comment.
+        dbg_log_heap_info("pushPBSlot");
     }
 }
 
@@ -963,10 +1271,33 @@ static void pollWe2Uart1Handshake() {
             log_i("WE2 UART1 handshake echoed - output should switch over shortly");
             return;
         }
-        log_w("Unexpected byte 0x%02x while waiting for WE2 UART1 handshake - treating as evidence "
-              "WE2 is already live and handing off to fetchFramedMessages()...", (unsigned)c);
-        s_we2_uart1_synced = true;
-        return;
+        // 2026-07-17: was unconditional - ANY unexpected byte immediately
+        // gave up on the real handshake and marked s_we2_uart1_synced=true,
+        // on the assumption "WE2 must already be on UART1 sending real
+        // protocol data" (true for the ESP32-reboots-while-WE2-already-
+        // locked case this was written for). But if WE2 is genuinely still
+        // in its own probe loop (confirmed on hardware this session, via
+        // direct WE2-side console access: WE2 stuck repeating "probe write
+        // on UART1, ret=1" for 90+ seconds with zero echo ever seen) and a
+        // single stray/noise byte lands here first, this gave up
+        // permanently for the rest of the boot - WE2 never gets its real
+        // echo, keeps waiting forever, and every AT command times out even
+        // though I2C delivery/WE2-side processing are both fine (WE2's
+        // reply just goes out its still-USB-console output, nowhere this
+        // ESP32 is listening). Only trust a byte as "already-synced"
+        // evidence if it actually looks like the start of the real
+        // SSCMA reply framing (RESPONSE_PREFIX = '\r', see
+        // Seeed_Arduino_SSCMA.h) - any other stray byte is logged and
+        // ignored, keeping this poller armed for a later genuine probe.
+        if (c == '\r') {
+            log_w("Unexpected byte 0x%02x (looks like SSCMA reply framing) while waiting for WE2 "
+                  "UART1 handshake - treating as evidence WE2 is already live and handing off to "
+                  "fetchFramedMessages()...", (unsigned)c);
+            s_we2_uart1_synced = true;
+            return;
+        }
+        log_w("Unexpected byte 0x%02x while waiting for WE2 UART1 handshake (not the probe byte, "
+              "not reply-framing-shaped) - ignoring, still waiting for the real probe", (unsigned)c);
     }
 }
 
@@ -1020,6 +1351,31 @@ static void fetchFramedMessages(ResponseCallback cb) {
         }
         s_fetch_buf[s_fetch_len++] = (uint8_t)c;
     }
+    // 2026-07-17 (rev 2): NOT "any byte read off atSerial" (rev 1, reverted -
+    // hardware-confirmed broken). Only a byte that's part of a fully
+    // recognized frame (a complete JSON reply/event, or a complete audio
+    // frame) counts as proof WE2 is alive and genuinely on UART1 - see the
+    // two `s_last_uart1_rx_ms = millis();` calls below, at the two `pos +=`
+    // sites inside a recognized branch. Rev 1 counted ANY byte, including
+    // ones immediately discarded by the "not a recognized frame start, drop
+    // one byte" fallback a few lines down - and out_transport.c's periodic
+    // UART1 probe byte (0x16, unrelated to any real message) is exactly
+    // that: a stray byte fetchFramedMessages() reads, fails to recognize,
+    // and drops, while pollWe2Uart1Handshake() itself never even looks at
+    // atSerial because it early-returns whenever `s_we2_uart1_synced` is
+    // already true. Confirmed on hardware: with `s_we2_uart1_synced` stuck
+    // true from before a WE2-only reboot (the exact scenario
+    // WE2_RESYNC_TIMEOUT_THRESHOLD exists to recover from), WE2's probe
+    // bytes alone (5+s apart, `out_transport: probe write... ret=1` logged
+    // 339 times with zero echoes over one 5-minute test) kept refreshing
+    // rev 1's "still alive" belief just often enough that
+    // WE2_RESYNC_SILENCE_MS's countdown never ran out, permanently blocking
+    // the resync this scenario needs - every single AT+ASR attempt timed
+    // out (verified via WE2's own console: it received and replied to all
+    // 5 I2C-delivered attempts correctly, but every reply went to its still-
+    // USB-attached console since the handshake had never switched output to
+    // UART1). Real recognized traffic doesn't have this problem: it can
+    // only exist after the handshake has already succeeded once.
 
     if (s_fetch_len >= (FETCH_BUF_SIZE - 4096) && s_fetch_len != s_dbg_last_logged_len) {
         log_w("DBG fetchFramedMessages: s_fetch_len high-watermark=%u/%u (first 16 bytes: "
@@ -1060,6 +1416,7 @@ static void fetchFramedMessages(ResponseCallback cb) {
                 // comment and stream_audio_handler().
                 pushPBSlot(MSG_TYPE_AUDIO, &s_fetch_buf[pos], frame_total);
                 pos += frame_total;
+                s_last_uart1_rx_ms = millis();
                 continue;
             }
         }
@@ -1083,6 +1440,7 @@ static void fetchFramedMessages(ResponseCallback cb) {
                 cb((const char*)&s_fetch_buf[pos], msg_len);
             }
             pos += msg_len;
+            s_last_uart1_rx_ms = millis();
             continue;
         }
 
@@ -1117,17 +1475,26 @@ httpd_handle_t web_httpd = NULL;
 
 /* 2026-07-12: used to be one `stream_httpd` hosting both /stream/result and
  * /stream/audio (and, briefly, a third /stream/frame image relay - dropped
- * entirely per explicit direction) -
- * but esp_http_server gives each httpd_start() instance exactly one worker
- * task, which serializes every handler registered on it. Confirmed on
- * hardware: a single client wanting both streams at once saw the second
- * connection's handler never even get scheduled - accepted at the TCP
- * level, then queued indefinitely - until the first one's handler function
- * returned. Split onto two separate instances, each its own worker task on
- * its own port, so bbox and audio streaming genuinely run in parallel
- * instead of taking turns. */
-httpd_handle_t result_httpd = NULL;  // /stream/result (JSON events, bbox only)
-httpd_handle_t audio_httpd  = NULL;  // /stream/audio  (raw framed PCM)
+ * entirely per explicit direction) - but esp_http_server gives each
+ * httpd_start() instance exactly one worker task, which serializes every
+ * handler registered on it. Confirmed on hardware: a single client wanting
+ * both streams at once saw the second connection's handler never even get
+ * scheduled - accepted at the TCP level, then queued indefinitely - until
+ * the first one's handler function returned. Split onto two separate
+ * instances, each its own worker task on its own port, so bbox and audio
+ * streaming genuinely ran in parallel instead of taking turns.
+ *
+ * 2026-07-18: split back into ONE instance again (`data_httpd`, replacing
+ * both `result_httpd`/`audio_httpd`) - root-caused that session that two
+ * simultaneous NEW connections, one per port, spiked heap sharply enough at
+ * accept-time to collapse the WiFi/httpd stack under repeated combined-load
+ * cycling (see esp32_camera_web_server_bridge memory, 2026-07-18 section).
+ * stream_data_handler() now interleaves both AUDIO and EVENT/bbox traffic
+ * over one connection/worker/accept() instead - the "taking turns" problem
+ * this split originally fixed doesn't recur, because it's no longer two
+ * independent client connections queuing behind one worker; it's one
+ * handler's own poll loop checking both data sources every iteration. */
+httpd_handle_t data_httpd = NULL;  // /stream/data (AUDIO + EVENT/bbox, merged)
 
 typedef struct {
     size_t size;   //number of values used for filtering
@@ -1257,42 +1624,87 @@ static esp_err_t results_handler(httpd_req_t* req) {
 }
 
 /* Forward declaration - defined after sendTaggedCommand(), which it wraps;
- * stream_result_handler()/stream_audio_handler() below need it earlier in
- * the file than that definition lives. */
+ * stream_data_handler() below needs it earlier in the file than that
+ * definition lives. */
 static void sendBreakBestEffort();
 
 /* 2026-07-12: WE2's AT+BREAK is a universal stop - it kills the camera
  * INVOKE/SAMPLE loop AND the audio ASAMPLE loop together, there's no
  * modality-specific stop (see audio_stop_handler's own comment on this).
- * Every /stream/* handler below calls this exactly once, at its single
- * common exit point (replacing what used to be a bare `s_..._clients -= 1`)
- * - on the assumption that once nobody's watching *anything*, WE2 should
- * stop wasting power/NPU cycles, but a lone modality's client leaving
- * mustn't kill an unrelated, still-connected client's stream.
+ * stream_data_handler() calls this exactly once, at its single exit point,
+ * once its own client is gone - on the assumption that once nobody's
+ * watching, WE2 should stop wasting power/NPU cycles.
  *
- * 2026-07-12 (rev 2): originally this decremented the caller's counter
- * separately (at the true end of the function) from a *pre*-decrement
- * "<=1" check called earlier, right before each `break` - correct only
- * because stream_result_handler()/stream_audio_handler() used to share one
- * stream_httpd worker task, so at most one of them was ever actually
- * running this logic at a time. Now that each runs on its own dedicated
- * httpd instance (see startCameraServer()'s comment on why), both can
- * genuinely disconnect at the same instant on different tasks, and a
- * "check before I've decremented" pattern has a real TOCTOU race (two
- * threads can each see the other's not-yet-decremented count and both skip
- * sending BREAK). Fixed by decrementing THIS caller's own counter first
- * (atomically), then checking BOTH counters - whichever of the two
- * decrements happens last in real time is guaranteed to observe both
- * already at zero and send BREAK exactly once; the other observes the
- * not-yet-departed sibling and correctly stays quiet. */
-static void disconnectStreamClient(std::atomic<int>* my_counter) {
-    my_counter->fetch_sub(1);
-    if (s_event_stream_clients.load() <= 0 && s_audio_stream_clients.load() <= 0) {
+ * 2026-07-18: was two counters (`s_event_stream_clients`/
+ * `s_audio_stream_clients`, one per then-separate `/stream/result`+
+ * `/stream/audio` httpd instance) with a TOCTOU-safe decrement-then-check-
+ * both dance, needed because two independent worker tasks could each
+ * disconnect at the same instant. Now that both traffic types share ONE
+ * `/stream/data` connection/handler/task (see s_data_stream_clients' own
+ * comment - merged specifically to remove the simultaneous-dual-accept
+ * heap spike that caused, not just to simplify this), there is only ever
+ * one caller of this function at a time - a plain decrement-then-check is
+ * sufficient again. */
+
+// 2026-07-19: SECOND attempt at httpd_sess_trigger_close(), this time
+// genuinely ASYNC (fired from esp_timer's own dedicated task, not from
+// inside stream_data_handler() itself) - TRIED AND REVERTED AGAIN. Hardware
+// result: measurably WORSE than the drop-streak-timeout fix alone (20-cycle
+// reconnect test collapsed by cycle 2, vs cycle 16 without this). Root
+// cause of the regression, confirmed via dual before/after console
+// timestamps: the timer was armed with only a 10ms delay, intended just to
+// satisfy "runs on a different task" - but 10ms is far shorter than
+// stream_data_handler()'s OWN teardown sequence (NULL-chunk terminator +
+// disconnectStreamClient() - measured ~1000ms end to end on the same
+// hardware run), so the async trigger fired WHILE the owning task was still
+// actively using the same socket, not after. Both this codebase's own first
+// (synchronous) attempt at this API AND this second (nominally async, but
+// still racing) attempt regressed things, on two separate hardware tests -
+// treat httpd_sess_trigger_close() as not viable in this codebase without
+// a much more careful hand-off (e.g. a real cross-task signal that only
+// fires after stream_data_handler() has FULLY returned, not a short fixed
+// delay) - not attempted further this session. The drop-streak-timeout
+// force-disconnect (see DROP_STREAK_LIMIT_MS above) is real, measured
+// progress on its own (crash pushed from cycle 7 to cycle 16) and is kept;
+// this file no longer calls httpd_sess_trigger_close() anywhere.
+
+// 2026-07-19: THIRD attempt at reclaiming a stuck TCP send buffer, after
+// both httpd_sess_trigger_close() attempts regressed things (see this
+// file's own comment just above) - TRIED AND REVERTED TOO. This one skipped
+// the esp_http_server session-close API entirely and worked one layer down:
+// setsockopt(SO_LINGER, {1,0}) + close() the raw fd directly, synchronously,
+// from the same task that owns it, specifically to avoid the cross-task
+// race the first two attempts had. Hardware result: same class of
+// regression as the other two - 20-cycle reconnect test collapsed by cycle
+// 2 again. Diagnostic detail worth keeping: setsockopt(SO_LINGER) itself
+// FAILED (errno=109) - this lwIP socket layer doesn't support SO_LINGER at
+// all, so the following close() was just an ordinary graceful close, not
+// the intended abortive RST - and even that plain close(), called on a
+// fd the framework still considers open/owned, made things worse than not
+// closing it at all. Three different mechanisms (framework API sync,
+// framework API async, raw POSIX close) have now all regressed this exact
+// test - the consistent conclusion is that esp_http_server in this
+// ESP-IDF/Arduino version does not tolerate the app touching a session's
+// socket from outside the handler's own normal return path, full stop.
+// Not attempting a fourth variant of "close it ourselves" - the
+// drop-streak-timeout disconnect (DROP_STREAK_LIMIT_MS above), which only
+// ever returns a non-OK code and lets the framework do its own cleanup in
+// its own time, is the version worth keeping.
+
+static void disconnectStreamClient(const char* reason) {
+    s_data_stream_clients.fetch_sub(1);
+    // TEMP DIAGNOSTIC (2026-07-17): tracking down a real, confirmed heap
+    // leak/fragmentation that only shows up across many repeated
+    // stream-connect/disconnect cycles (not visible within one clean run -
+    // see esp32_camera_web_server_bridge memory). Logs `reason` (one of the
+    // log strings each break site already had) so a clean close vs. a
+    // timeout/error-driven one can be told apart in the data. Remove once
+    // resolved.
+    dbg_log_heap_info(reason);
+    log_w("DBG disconnectStreamClient (counter after decrement=%d, reason=%s)",
+          (int)s_data_stream_clients.load(), reason);
+    if (s_data_stream_clients.load() <= 0) {
         sendBreakBestEffort();
-    } else {
-        log_i("disconnectStreamClient: another stream client still active "
-              "(event=%d audio=%d) - not stopping WE2...",
-              s_event_stream_clients.load(), s_audio_stream_clients.load());
     }
 }
 
@@ -1342,20 +1754,28 @@ static bool client_gone(httpd_req_t* req) {
     return false;
 }
 
-/* 2026-07-12: relays raw AT+ASAMPLE binary frames (see MSG_TYPE_AUDIO's and
- * fetchFramedMessages()'s comments) to whatever's connected here, untouched
- * - this sketch doesn't decode PCM/WAV itself, a downstream platform does.
- * Plain application/octet-stream chunked body - each WE2 binary frame
- * already carries its own self-describing header/length, a client just
- * needs to re-run the same framing this sketch itself parses in
- * fetchFramedMessages(). Sends every not-yet-sent AUDIO slot in order -
- * dropping PCM chunks would leave audible gaps downstream. */
-static esp_err_t stream_audio_handler(httpd_req_t* req) {
+/* 2026-07-18: merged former stream_audio_handler()+stream_result_handler()
+ * into ONE connection/handler/worker task - see s_data_stream_clients' own
+ * comment for why (root-caused: two simultaneous NEW connections, one per
+ * port, spiked heap sharply enough at accept-time to collapse the WiFi/
+ * httpd stack under repeated combined-load cycling). Both AUDIO (raw framed
+ * PCM, see MSG_TYPE_AUDIO's comment) and EVENT/bbox (one INVOKE JSON line
+ * per detection batch, `\r\n`-terminated) traffic now share this single
+ * `application/octet-stream` chunked body. No new envelope invented - a
+ * client demuxes exactly the way this sketch's own fetchFramedMessages()
+ * already does on the UART1 side: check for the audio magic
+ * (`0xFF 'S' 'M' 'B'`) first, otherwise it's a JSON line ending in `\r\n`
+ * (buildInvokeJson()'s output always starts with `{`, which can never
+ * collide with the audio magic's leading 0xFF byte). Sends every
+ * not-yet-sent slot of both types per poll, audio first then bbox -
+ * dropping either would leave gaps downstream. */
+static esp_err_t stream_data_handler(httpd_req_t* req) {
     if (!checkAuth(req)) {
         return ESP_FAIL;
     }
-    esp_err_t res     = ESP_OK;
-    size_t    last_id = 0;
+    esp_err_t        res          = ESP_OK;
+    size_t           audio_last_id = 0;
+    static uint64_t  bbox_last_id  = 0;
 
     res = httpd_resp_set_type(req, "application/octet-stream");
     if (res != ESP_OK) {
@@ -1363,93 +1783,79 @@ static esp_err_t stream_audio_handler(httpd_req_t* req) {
     }
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    // See s_audio_stream_clients's own comment - pushPBSlot() checks this
-    // to decide whether AUDIO backlog is worth retaining at all.
-    s_audio_stream_clients += 1;
-
-    // 2026-07-12: see stream_result_handler's identical comment - hard
-    // backstop against client_gone() not detecting a dead peer promptly.
-    TickType_t idle_since               = xTaskGetTickCount();
-    const TickType_t IDLE_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
-
-    while (true) {
-        std::vector<std::shared_ptr<PtrBuffer::Slot>> pending;
-        {
-            xSemaphoreTake(PB.mutex, portMAX_DELAY);
-            for (auto& s : PB.slots) {
-                if (s->id > last_id && s->type == MSG_TYPE_AUDIO) {
-                    pending.push_back(s);
-                }
+    // 2026-07-17: Nagle's algorithm (on by default) can hold a small chunk
+    // send for up to ~40ms waiting to coalesce with more data or an ACK -
+    // audio frames arrive ~125ms apart and each is sent as its own chunk, so
+    // that's a meaningful bite out of the inter-frame budget on every single
+    // send, compounding into AUDIO_POOL_SLOTS exhaustion ("both pool slots
+    // busy" - see esp32_camera_web_server_bridge memory) under sustained
+    // streaming. This is a one-way, low-latency-sensitive relay, not a use
+    // case Nagle's coalescing-for-bandwidth-efficiency trade-off suits at
+    // all - disable it on this stream's socket.
+    {
+        int fd = httpd_req_to_sockfd(req);
+        if (fd >= 0) {
+            int one = 1;
+            if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
+                log_w("stream_data_handler: setsockopt(TCP_NODELAY) failed, errno=%d", errno);
             }
-            xSemaphoreGive(PB.mutex);
-        }
-
-        if (pending.empty()) {
-            if (client_gone(req)) {
-                log_w("stream_audio_handler: client gone while idle, stopping WE2 stream...");
-                break;
+            // 2026-07-18: root-caused on hardware (send_chunk heap-delta
+            // diagnostic) - with no send timeout, a client that can't drain
+            // fast enough leaves httpd_resp_send_chunk() blocked for SECONDS
+            // (measured: ~6s with zero send attempts logged) before the
+            // socket layer finally errors out on its own. During that whole
+            // window this task can't drain audio_pending, so it keeps
+            // pool-exhausting new WE2 audio (see "both pool slots busy") and
+            // the slow client silently drags everything down with it.
+            // Explicit direction: WE2's send rate is authoritative - a slow
+            // client should have its OWN data dropped, not stall the whole
+            // pipe. A short send timeout turns an indefinite block into a
+            // bounded one, so the per-chunk drop logic below (see the
+            // EAGAIN/EWOULDBLOCK/ETIMEDOUT branch) gets a chance to run
+            // instead of the task just sitting there.
+            struct timeval snd_timeout;
+            snd_timeout.tv_sec  = 0;
+            snd_timeout.tv_usec = 200 * 1000;  // 200ms - a few chunk intervals, not a full stall
+            if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd_timeout, sizeof(snd_timeout)) != 0) {
+                log_w("stream_data_handler: setsockopt(SO_SNDTIMEO) failed, errno=%d", errno);
             }
-            if ((xTaskGetTickCount() - idle_since) >= IDLE_TIMEOUT_TICKS) {
-                log_w("stream_audio_handler: idle timeout (10s with nothing new), "
-                      "stopping WE2 stream as a backstop...");
-                break;
-            }
-            vTaskDelay(5 / portTICK_PERIOD_MS);
-            continue;
-        }
-        idle_since = xTaskGetTickCount();
 
-        // 2026-07-12: under continuous traffic this loop never goes idle, so
-        // the client_gone() check above never runs - a dead peer left this
-        // task blocked inside httpd_resp_send_chunk() for 58+ seconds on
-        // hardware (confirmed: event_clients/audio_clients stayed pinned at
-        // 1 with zero progress) because the socket's own send-side didn't
-        // error out promptly. Re-check (cheap, non-blocking MSG_PEEK) right
-        // before every send attempt too, not just when idle.
-        if (client_gone(req)) {
-            log_w("stream_audio_handler: client gone (detected before active send), stopping WE2 stream...");
-            break;
-        }
-
-        bool send_failed = false;
-        for (auto& slot : pending) {
-            last_id = slot->id;
-            res     = httpd_resp_send_chunk(req, (const char*)slot->data, slot->size);
-            if (res != ESP_OK) {
-                send_failed = true;
-                break;
-            }
-        }
-        if (send_failed) {
-            log_e("Send audio frame failed - client disconnected, stopping WE2 stream...");
-            break;
+            // 2026-07-19: TRIED tight TCP keepalive (SO_KEEPALIVE +
+            // TCP_KEEPIDLE=2/TCP_KEEPINTVL=1/TCP_KEEPCNT=3), motivated by
+            // github.com/espressif/esp-idf issue #8668 ("LwIP socket:
+            // unwanted behaviour and memory leak after 'pulling-the-plug'
+            // event", Espressif-confirmed, "Won't Do") - REVERTED again
+            // after a THIRD 20-cycle test result, this time with the test
+            // tooling's own bugs fixed first (see below). Results across all
+            // three runs of this exact unchanged config: cycle 1, cycle 18,
+            // cycle 1 - the cycle-18 run looks like the outlier, not the
+            // norm, once a third data point was collected. The cycle-18
+            // run's apparent win is what originally motivated re-testing
+            // with fixed tooling in the first place: the session scratchpad
+            // test scripts (coverage_test.py/matrix11.py) AND this repo's
+            // own client/media_client.py all had a pure-Python bit-loop
+            // CRC16 (~60ms/8KB audio frame, benchmarked on the Orange Pi
+            // host) that could make the TEST SCRIPT ITSELF intermittently
+            // the "slow client" under host CPU load, independent of real
+            // WiFi/firmware behavior - a very plausible source of this
+            // session's wide run-to-run variance. Fixed to table-driven
+            // CRC16 (~6x faster) in all three files - but even with that
+            // fixed, this exact keepalive config still collapsed by cycle 1
+            // on the very next test. Net: not ruled out as harmful, but no
+            // longer trusted as a proven win either - reverted back to
+            // DROP_STREAK_LIMIT_MS alone (this file's other real,
+            // consistently-kept fix) pending a clean baseline-vs-keepalive
+            // comparison using the now-fixed test tooling on both sides.
         }
     }
 
-    disconnectStreamClient(&s_audio_stream_clients);
-
-    return res;
-}
-
-static esp_err_t stream_result_handler(httpd_req_t* req) {
-    if (!checkAuth(req)) {
-        return ESP_FAIL;
-    }
-    esp_err_t        res     = ESP_OK;
-    static uint64_t  last_id = 0;
-
-    res |= httpd_resp_set_status(req, HTTPD_200);
-    res |= httpd_resp_set_type(req, "application/json");
-    res |= httpd_resp_set_hdr(req, "Connection", "keep-alive");
-    res |= httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    if (res != ESP_OK) {
-        log_e("Failed to set response headers...");
-        return res;
-    }
-
-    // See s_event_stream_clients's own comment - pushPBSlot() checks this
-    // to decide whether EVENT backlog is worth retaining at all.
-    s_event_stream_clients += 1;
+    // See s_data_stream_clients' own comment - pushPBSlot() checks this to
+    // decide whether AUDIO backlog is worth retaining at all.
+    s_data_stream_clients += 1;
+    // TEMP DIAGNOSTIC (2026-07-17) - see disconnectStreamClient()'s comment.
+    log_w("DBG stream_data_handler CONNECT heap: free=%u largest=%u",
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     // 2026-07-12: hard backstop against client_gone()'s MSG_PEEK detection
     // not firing promptly. Confirmed on hardware via targeted tracing: a
@@ -1460,81 +1866,331 @@ static esp_err_t stream_result_handler(httpd_req_t* req) {
     // connection attempt to this port just queued at the TCP level
     // (accepted, per max_open_sockets) without ever actually being
     // serviced. Root cause of the slow detection itself wasn't pinned down
-    // (a curl -m timeout's close() should send a normal FIN, which
-    // MSG_PEEK's recv()==0 should catch quickly) - this is a pragmatic
-    // ceiling regardless of why: EVENT traffic arrives every ~200-250ms
-    // when the camera's running, so genuinely nothing new for 10 straight
-    // seconds already means either nobody's watching or something's stuck
-    // - safe to just close and let a fresh connection start clean either
-    // way.
+    // - this is a pragmatic ceiling regardless of why: real traffic arrives
+    // every ~125-250ms when camera/audio is running, so genuinely nothing
+    // new for 10 straight seconds already means either nobody's watching or
+    // something's stuck - safe to just close and let a fresh connection
+    // start clean either way.
     TickType_t idle_since               = xTaskGetTickCount();
     const TickType_t IDLE_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
+    const char*       disconnect_reason  = "loop_exit_unexpected";  // see disconnectStreamClient()'s DBG comment
+
+    // 2026-07-18: pending audio/bbox queues now live OUTSIDE the outer
+    // while loop (were re-collected fresh every iteration) so a big bbox
+    // burst can be capped and spread across several outer-loop passes
+    // instead of drained in one shot - see BBOX_BURST_CAP's own comment
+    // below for why a per-pass cap turned out to be necessary even after
+    // interleaving audio+bbox sends (2026-07-18 earlier fix): interleaving
+    // alone provides ZERO protection for a camera-ONLY connection (no
+    // audio ever available to interleave with), and a real hardware test
+    // (11-combo matrix, camera-only resolution=0) reproduced the collapse
+    // through exactly that gap - heap crashed to free=7092/largest=1652
+    // within the first 30s of a pure camera-only run.
+    std::vector<SlotRef> audio_pending;
+    size_t                                        audio_idx = 0;
+    BboxEntry                                     bbox_entries[BBOX_RING_SLOTS];
+    size_t                                        bbox_count = 0;
+    size_t                                        bbox_pos   = 0;
+    static char                                   s_bbox_buf[RST_BUFFER_SIZE];
+
+    // 2026-07-19: ROOT CAUSE of the "heap freezes at a fixed value and
+    // never recovers, even though drops are firing" signature - hardware-
+    // confirmed via a 20-cycle rapid reconnect test (crashed by cycle 7,
+    // heap frozen at free=8568/largest=1652 for 30+ seconds straight while
+    // "dropping batch"/"dropping frame" kept firing every ~1s). The
+    // EAGAIN/EWOULDBLOCK/ETIMEDOUT drop-and-continue path (see the two drop
+    // sites below) correctly stops THIS task from blocking further, but it
+    // does NOT reclaim memory already queued in the OS/lwIP TCP send buffer
+    // from EARLIER successful-looking httpd_resp_send_chunk() calls (res==
+    // ESP_OK just means the OS accepted the bytes into its own send queue,
+    // not that the peer has actually read/ACKed them yet) - that backlog
+    // only gets freed when the peer drains it or the socket is torn down.
+    // A client that's merely "a little slow" recovers within a pass or two
+    // (this session's many successful runs prove that) - a client that's
+    // genuinely stuck/gone just keeps producing EAGAIN forever, and
+    // dropping one item at a time was never going to reclaim that stuck
+    // backlog. Track how long a streak of consecutive drops (either type)
+    // has been going; once it's been continuous for DROP_STREAK_LIMIT_MS,
+    // stop treating it as "a bit slow" and treat it as a real disconnect
+    // instead - closing the socket is what actually lets the OS reclaim
+    // the stuck send-buffer memory.
+    uint32_t drop_streak_start_ms = 0;
+#define DROP_STREAK_LIMIT_MS (3000u)
+    // 2026-07-19: TRIED skipping the NULL-chunk terminator send on the
+    // drop-streak-exceeded path (reasoning: a client that's been producing
+    // EAGAIN/timeout for a solid DROP_STREAK_LIMIT_MS is already confirmed
+    // dead, so sending it one more chunk just costs another SO_SNDTIMEO
+    // wait for nothing) - REVERTED. Confirmed on hardware the skip itself
+    // worked as intended (teardown went from ~1000ms to near-instant, per
+    // adjacent send_failed/disconnectStreamClient log timestamps), but the
+    // 20-cycle reconnect test still came out same-or-worse (cycle 4) than
+    // the plain drop-streak-timeout baseline (cycle 16) - heap still didn't
+    // recover after the faster disconnect either. Net: a logically sound,
+    // measurably-faster-teardown change with no measured stability benefit
+    // this session - not worth the added code path. Kept simple: always
+    // send the terminator, exactly as before DROP_STREAK_LIMIT_MS existed.
+
+    // Caps how many bbox batches get sent per outer-loop pass, regardless
+    // of how many are queued or whether any audio is available to
+    // interleave with. WE2 delivers bbox in bursts up to BBOX_RING_SLOTS
+    // (20) at once, especially right after a camera restart while auto-
+    // exposure/gain is still settling - draining all 20 in one uninterrupted
+    // run of httpd_resp_send_chunk() calls (the old behavior, and still the
+    // behavior of the pure-interleave fix when there's no audio to pair
+    // each bbox send with) is what spikes heap/network pressure sharply
+    // enough to collapse the connection. Small on purpose: forces the
+    // outer loop back to its top (re-check client_gone(), let the
+    // scheduler/network stack breathe) every few sends instead of
+    // blasting a whole burst through unchecked.
+#define BBOX_BURST_CAP (3)
 
     while (res == ESP_OK) {
-        BboxEntry entries[BBOX_RING_SLOTS];
-        size_t    count = drainBboxSince(&last_id, entries);
+        if (audio_idx >= audio_pending.size() && bbox_pos >= bbox_count) {
+            audio_pending.clear();
+            audio_idx = 0;
+            {
+                xSemaphoreTake(PB.mutex, portMAX_DELAY);
+                for (auto& s : PB.slots) {
+                    if (s->id > audio_last_id && s->type == MSG_TYPE_AUDIO) {
+                        audio_pending.push_back(s);
+                    }
+                }
+                xSemaphoreGive(PB.mutex);
+            }
+            bbox_count = drainBboxSince(&bbox_last_id, bbox_entries);
+            bbox_pos   = 0;
 
-        if (count == 0) {
-            if (client_gone(req)) {
-                log_w("stream_result_handler: client gone while idle, stopping WE2 stream...");
-                break;
+            if (audio_pending.empty() && bbox_count == 0) {
+                if (client_gone(req)) {
+                    log_w("stream_data_handler: client gone while idle, stopping WE2 stream...");
+                    disconnect_reason = "client_gone_idle";
+                    break;
+                }
+                if ((xTaskGetTickCount() - idle_since) >= IDLE_TIMEOUT_TICKS) {
+                    log_w("stream_data_handler: idle timeout (10s with nothing new), "
+                          "stopping WE2 stream as a backstop...");
+                    disconnect_reason = "idle_timeout";
+                    break;
+                }
+                // 2026-07-17: was 5ms (200Hz) in the old audio-only handler -
+                // see the old stream_result_handler's identical reasoning
+                // (removed with the merge, kept here): quarters this loop's
+                // CPU/scheduling footprint on this board's single core with
+                // no perceptible latency cost.
+                vTaskDelay(20 / portTICK_PERIOD_MS);
+                continue;
             }
-            if ((xTaskGetTickCount() - idle_since) >= IDLE_TIMEOUT_TICKS) {
-                log_w("stream_result_handler: idle timeout (10s with nothing new), "
-                      "stopping WE2 stream as a backstop...");
-                break;
-            }
-            vTaskDelay(5 / portTICK_PERIOD_MS);
-            continue;
+            idle_since = xTaskGetTickCount();
         }
-        idle_since = xTaskGetTickCount();
 
-        // 2026-07-12: see stream_audio_handler's identical comment - under
-        // continuous EVENT traffic this loop never goes idle, so the
-        // client_gone() check above never runs. Re-check right before every
-        // active send too.
+        // 2026-07-12: under continuous traffic this loop never goes idle,
+        // so the client_gone() check above never runs - a dead peer left
+        // this task blocked inside httpd_resp_send_chunk() for 58+ seconds
+        // on hardware because the socket's own send-side didn't error out
+        // promptly. Re-check (cheap, non-blocking MSG_PEEK) right before
+        // every send pass too, not just when idle.
         if (client_gone(req)) {
-            log_w("stream_result_handler: client gone (detected before active send), stopping WE2 stream...");
+            log_w("stream_data_handler: client gone (detected before active send), stopping WE2 stream...");
+            disconnect_reason = "client_gone_active";
             break;
         }
 
-        // 2026-07-12: rebuilds the entries copied out of the ring (under
-        // s_bbox_mutex, inside drainBboxSince()) into one INVOKE JSON line
-        // PER BATCH (boxes that arrived together in the same WE2 message) -
-        // see buildInvokeJson()'s own comment. A single poll can carry
-        // several batches at once (WE2 delivers bbox in bursts, see
-        // BBOX_RING_SLOTS' own comment) - this loop sends each as its own
-        // chunk instead of collapsing them into one. Static buffer: this
-        // handler's own dedicated httpd instance still only has one worker
-        // task, so exactly one invocation of this function ever runs at a
-        // time - same single-writer assumption results_handler()'s rst_buf
-        // already relies on.
-        static char s_bbox_buf[RST_BUFFER_SIZE];
-        size_t      pos = 0;
-        while (pos < count && res == ESP_OK) {
-            size_t out_len  = 0;
-            size_t consumed = buildInvokeJson(&entries[pos], count - pos, entries[pos].id, s_bbox_buf,
-                                               sizeof(s_bbox_buf), &out_len);
-            if (consumed == 0) {
-                break;  // shouldn't happen (count - pos > 0 here), safety backstop
+        // 2026-07-18: interleave one audio slot with one bbox batch,
+        // alternating, capped at BBOX_BURST_CAP bbox sends per pass - see
+        // that macro's own comment. The client already demuxes by content
+        // (audio magic vs JSON `{`), so interleaving/pacing order doesn't
+        // need a new envelope - same wire format, just paced differently.
+        bool   send_failed         = false;
+        size_t bbox_sent_this_pass = 0;
+        while ((audio_idx < audio_pending.size() ||
+                (bbox_pos < bbox_count && bbox_sent_this_pass < BBOX_BURST_CAP)) &&
+               !send_failed) {
+            if (audio_idx < audio_pending.size()) {
+                auto& slot    = audio_pending[audio_idx++];
+                audio_last_id = slot->id;
+                // TEMP DIAGNOSTIC (2026-07-18): bracket the one call in this
+                // whole path we DON'T control (httpd_resp_send_chunk() ->
+                // esp_http_server -> lwIP) with a heap reading immediately
+                // before/after, to see whether the send call itself is
+                // consuming general heap (TCP send-queue/pbuf growth while a
+                // slow client can't drain fast enough) as opposed to
+                // anything app_httpd.cpp itself allocates - the audio
+                // payload pool and Slot metadata pool are both fixed-size
+                // and shouldn't touch the general heap at all. Only logs
+                // when something actually moved, to avoid flooding at the
+                // normal several-sends/sec rate.
+                size_t free_before_send = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+                errno                   = 0;
+                res                     = httpd_resp_send_chunk(req, (const char*)slot->data, slot->size);
+                int    send_errno       = errno;
+                size_t free_after_send  = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+                if (free_after_send != free_before_send) {
+                    log_w("DBG send_chunk heap delta: before=%u after=%u delta=%d "
+                          "audio_pending.size=%u audio_idx=%u res=%d errno=%d",
+                          (unsigned)free_before_send, (unsigned)free_after_send,
+                          (int)free_after_send - (int)free_before_send,
+                          (unsigned)audio_pending.size(), (unsigned)audio_idx, (int)res, send_errno);
+                }
+                if (res != ESP_OK) {
+                    // 2026-07-18: root-caused on hardware - with no send
+                    // timeout, a slow/lagging client left this task blocked
+                    // for ~6s doing nothing (see SO_SNDTIMEO's own comment
+                    // above). Explicit direction: WE2's send rate is
+                    // authoritative - a client that can't keep up should
+                    // lose ITS OWN data, not stall the whole pipe or get
+                    // torn down over one slow chunk. EAGAIN/EWOULDBLOCK
+                    // (send buffer full, non-blocking) and ETIMEDOUT
+                    // (SO_SNDTIMEO fired) both mean "client's still there
+                    // but too slow right now" - drop this one frame and keep
+                    // going. Anything else (ECONNRESET, EPIPE, ENOTCONN,
+                    // ...) means the socket itself is actually gone - that's
+                    // still a real disconnect, handled exactly as before.
+                    if (send_errno == EAGAIN || send_errno == EWOULDBLOCK || send_errno == ETIMEDOUT) {
+                        uint32_t now_ms = millis();
+                        if (drop_streak_start_ms == 0) {
+                            drop_streak_start_ms = now_ms;
+                        }
+                        if (now_ms - drop_streak_start_ms >= DROP_STREAK_LIMIT_MS) {
+                            log_e("stream_data_handler: drop streak exceeded %ums (audio) - "
+                                  "client presumed dead, forcing disconnect to reclaim TCP "
+                                  "send buffer - see DROP_STREAK_LIMIT_MS's own comment",
+                                  (unsigned)DROP_STREAK_LIMIT_MS);
+                            slot.reset();
+                            send_failed = true;
+                            break;
+                        }
+                        log_w("stream_data_handler: audio send timed out (client too slow) - "
+                              "dropping frame id=%u, errno=%d", (unsigned)slot->id, send_errno);
+                        slot.reset();
+                        // bbox's send below uses `res |=` across its own two
+                        // calls - it must start from ESP_OK, not this dropped
+                        // audio attempt's leftover failure code, or a
+                        // perfectly fine bbox send would look like it failed
+                        // too and needlessly kill the connection.
+                        res = ESP_OK;
+                        continue;
+                    }
+                    send_failed = true;
+                    break;
+                }
+                // 2026-07-17: release this slot's shared_ptr the moment
+                // ITS OWN send completes - see AUDIO_POOL_SLOTS' own
+                // comment on why (pool exhaustion from a lagging
+                // first-of-batch release).
+                slot.reset();
+                drop_streak_start_ms = 0;  // a real send got through - streak's over
             }
-            pos += consumed;
-            if (out_len == 0) {
-                log_e("stream_result_handler: failed to rebuild INVOKE json "
-                      "(buffer too small) - skipping this batch...");
-                continue;
+            if (bbox_pos < bbox_count && bbox_sent_this_pass < BBOX_BURST_CAP) {
+                // 2026-07-12: rebuilds the entries copied out of the ring
+                // (under s_bbox_mutex, inside drainBboxSince()) into one
+                // INVOKE JSON line PER BATCH (boxes that arrived together
+                // in the same WE2 message) - see buildInvokeJson()'s own
+                // comment. Static buffer: this handler's httpd instance
+                // still only has one worker task, so exactly one
+                // invocation of this function ever runs at a time - same
+                // single-writer assumption results_handler()'s rst_buf
+                // already relies on.
+                size_t out_len  = 0;
+                size_t consumed = buildInvokeJson(&bbox_entries[bbox_pos], bbox_count - bbox_pos,
+                                                   bbox_entries[bbox_pos].id, s_bbox_buf, sizeof(s_bbox_buf),
+                                                   &out_len);
+                if (consumed == 0) {
+                    break;  // shouldn't happen (bbox_count - bbox_pos > 0 here), safety backstop
+                }
+                bbox_pos += consumed;
+                bbox_sent_this_pass++;
+                if (out_len > 0) {
+                    errno = 0;
+                    res |= httpd_resp_send_chunk(req, s_bbox_buf, out_len);
+                    res |= httpd_resp_send_chunk(req, MSG_TERMI_STR, strlen(MSG_TERMI_STR));
+                    int bbox_errno = errno;
+                    if (res != ESP_OK) {
+                        // 2026-07-18: same drop-not-disconnect treatment as
+                        // the audio branch above - see SO_SNDTIMEO's comment.
+                        // bbox_pos already advanced past this batch, so
+                        // "dropping" here just means not retrying it - matches
+                        // WE2's own AT+SAMPLE/INVOKE semantics (each report is
+                        // a point-in-time event, not something meant to be
+                        // replayed late).
+                        if (bbox_errno == EAGAIN || bbox_errno == EWOULDBLOCK || bbox_errno == ETIMEDOUT) {
+                            uint32_t now_ms = millis();
+                            if (drop_streak_start_ms == 0) {
+                                drop_streak_start_ms = now_ms;
+                            }
+                            if (now_ms - drop_streak_start_ms >= DROP_STREAK_LIMIT_MS) {
+                                log_e("stream_data_handler: drop streak exceeded %ums (bbox) - "
+                                      "client presumed dead, forcing disconnect to reclaim TCP "
+                                      "send buffer - see DROP_STREAK_LIMIT_MS's own comment",
+                                      (unsigned)DROP_STREAK_LIMIT_MS);
+                                send_failed = true;
+                                break;
+                            }
+                            log_w("stream_data_handler: bbox send timed out (client too slow) - "
+                                  "dropping batch, errno=%d", bbox_errno);
+                            res = ESP_OK;
+                            continue;
+                        }
+                        send_failed = true;
+                        break;
+                    }
+                    drop_streak_start_ms = 0;  // a real send got through - streak's over
+                }
             }
-            res |= httpd_resp_send_chunk(req, s_bbox_buf, out_len);
-            res |= httpd_resp_send_chunk(req, MSG_TERMI_STR, strlen(MSG_TERMI_STR));
         }
 
-        if (res != ESP_OK) {
-            log_e("Send results failed...");
+        if (send_failed) {
+            log_e("stream_data_handler: send failed - client disconnected, stopping WE2 stream...");
+            disconnect_reason = "send_failed";
             break;
         }
     }
+#undef BBOX_BURST_CAP
+#undef DROP_STREAK_LIMIT_MS
 
-    disconnectStreamClient(&s_event_stream_clients);
+    // 2026-07-18: ROOT CAUSE FOUND this session (raw-socket byte-rate probe,
+    // held one connection open across restart cycles - see
+    // esp32_camera_web_server_bridge memory's "Experiment A" section) - this
+    // handler's chunked-transfer-encoding response was NEVER explicitly
+    // terminated (no trailing zero-length chunk) before returning. That's
+    // harmless on the send_failed path (the client's TCP side is already
+    // confirmed gone by then, nothing left to tell it), but on the
+    // SERVER-initiated exit paths - idle_timeout, client_gone_idle/active -
+    // the client can still be alive and actively waiting for either more
+    // chunks or a proper end to the response. Confirmed on hardware: a
+    // client held open across an idle_timeout self-close never saw ANY
+    // socket-level close signal (recv() just blocked forever, no FIN) even
+    // though the server had already decremented s_data_stream_clients and
+    // moved on - a real "zombie" connection from the client's perspective.
+    // This is very likely the actual mechanism behind the "wifi+stream
+    // switch not releasing cleanly" root cause hunted most of this session:
+    // a client that (reasonably) treats a stalled connection as dead and
+    // reconnects would pile a genuinely-new connection on top of this
+    // zombie one, which the framework may still be holding/pooling for
+    // reuse - repeated over many cycles, this is exactly the kind of
+    // per-cycle resource accumulation this file's very first investigation
+    // into this bug already suspected. Best-effort: if the client truly is
+    // already gone (send_failed path), this just fails again harmlessly.
+    httpd_resp_send_chunk(req, NULL, 0);
+
+    // 2026-07-18: TRIED httpd_sess_trigger_close(req->handle,
+    // httpd_req_to_sockfd(req)) here, called synchronously from inside this
+    // same handler right before it returns anyway - REVERTED, made things
+    // measurably worse on hardware (combined camera+audio reconnect-cycling
+    // collapsed by cycle 3 instead of cycle 5-6). esp_http_server's own doc
+    // comment on this API says it's "only required in special circumstances
+    // wherein some application requires to close an httpd client session
+    // ASYNCHRONOUSLY" - i.e. from a DIFFERENT task than the one owning the
+    // session. Calling it synchronously from the owning handler's own task,
+    // milliseconds before that same handler's normal return would trigger
+    // the framework's own cleanup anyway, plausibly queues a redundant/
+    // conflicting close request that races with (or duplicates) the normal
+    // teardown path - not confirmed exactly how, but the hardware result
+    // was unambiguous. Left the NULL-chunk terminator above (that one did
+    // NOT regress anything) - if session-close needs revisiting, do it from
+    // a genuinely separate task/context, matching what the API doc actually
+    // asks for, not from within stream_data_handler() itself.
+
+    disconnectStreamClient(disconnect_reason);
 
     return res;
 }
@@ -1572,15 +2228,26 @@ static esp_err_t parse_get(httpd_req_t* req, char** obuf) {
  * or two browser tabs), so untagged replies couldn't be told apart. Returns
  * nullptr on timeout. cmd_tag_buf (caller-owned, >=32 bytes) is filled in
  * with the generated tag either way, for the caller's own diagnostics. */
-static std::shared_ptr<PtrBuffer::Slot> sendTaggedCommand(const char* body, size_t body_len, char* cmd_tag_buf,
+static SlotRef sendTaggedCommand(const char* body, size_t body_len, char* cmd_tag_buf,
                                                             size_t cmd_tag_buf_size,
                                                             uint32_t timeout_ms = RESULT_TIMEOUT_MS) {
+    // 2026-07-18: see s_cmd_mutex's own comment - this function is
+    // reachable concurrently from two different httpd worker tasks
+    // (web_httpd, for /camera or /audio or /command; data_httpd via
+    // disconnectStreamClient()/sendBreakBestEffort()). Held for the whole
+    // function (tag bookkeeping, the raw I2C write, and the reply-wait poll)
+    // so two callers can never interleave bytes on the shared Wire bus or
+    // clobber each other's s_awaited_tag. (Originally three worker tasks
+    // when /stream/result and /stream/audio were still two separate httpd
+    // instances - since merged into one, see data_httpd's own comment.)
+    MutexGuard cmd_lock(s_cmd_mutex);
+
     TickType_t ticks        = xTaskGetTickCount();
-    // masked to 12 bits (3 hex digits) - see CMD_TAG_FMT_STR's comment for
-    // why: %.3X is a minimum width, not a truncation, so the raw tick count
+    // masked to 16 bits (4 hex digits) - see CMD_TAG_FMT_STR's comment for
+    // why: %.4X is a minimum width, not a truncation, so the raw tick count
     // must be masked down first or it'd print all its digits and defeat the
     // whole point of shrinking this.
-    size_t cmd_tag_size = snprintf(cmd_tag_buf, cmd_tag_buf_size, CMD_TAG_FMT_STR, (unsigned)(ticks & 0xFFFu));
+    size_t cmd_tag_size = snprintf(cmd_tag_buf, cmd_tag_buf_size, CMD_TAG_FMT_STR, (unsigned)(ticks & 0xFFFFu));
 
     size_t last_id = PB.id;
 
@@ -1589,10 +2256,32 @@ static std::shared_ptr<PtrBuffer::Slot> sendTaggedCommand(const char* body, size
     s_awaited_tag[sizeof(s_awaited_tag) - 1] = '\0';
     xSemaphoreGive(PB.mutex);
 
-    AI.write(CMD_PREFIX, strlen(CMD_PREFIX));
-    AI.write(cmd_tag_buf, cmd_tag_size);
-    AI.write(body, body_len);
-    AI.write(CMD_SUFFIX, strlen(CMD_SUFFIX));
+    // 2026-07-17: was 4x AI.write() over atSerial (UART) - now sent over I2C
+    // instead (WE2's i2c_cmd.c feeds the same bytes into the same AT-command
+    // dispatcher). Replies still arrive over UART unchanged - see
+    // initI2CCommandChannel()'s comment. Same byte sequence as before, just
+    // over Wire instead of AI's configured transport.
+    //
+    // TEMP diagnostic (system-wide freeze under investigation): bracket the
+    // I2C call with explicit before/after prints and an explicit short
+    // timeout - Wire's documented default timeout is 50ms, but the freeze
+    // observed this session lasted 10-25+ seconds with zero further output
+    // anywhere (not even USB-CDC console, though ping/WiFi kept responding),
+    // so either the 50ms default isn't actually being honored by the
+    // underlying i2c_master_transmit() call, or the hang is somewhere else
+    // entirely - this will show definitively which.
+    Serial.printf("sendTaggedCommand: before Wire I2C send, tag=%s\r\n", cmd_tag_buf);
+    Wire.setTimeOut(200);
+    Wire.beginTransmission(WE2_I2C_CMD_ADDR);
+    Wire.write((const uint8_t*)CMD_PREFIX, strlen(CMD_PREFIX));
+    Wire.write((const uint8_t*)cmd_tag_buf, cmd_tag_size);
+    Wire.write((const uint8_t*)body, body_len);
+    Wire.write((const uint8_t*)CMD_SUFFIX, strlen(CMD_SUFFIX));
+    uint8_t i2c_err = Wire.endTransmission();
+    Serial.printf("sendTaggedCommand: after Wire I2C send, tag=%s, err=%u\r\n", cmd_tag_buf, (unsigned)i2c_err);
+    if (i2c_err != 0) {
+        Serial.printf("sendTaggedCommand: I2C write failed, err=%u\r\n", (unsigned)i2c_err);
+    }
 
     TickType_t time_begin = xTaskGetTickCount();
     while ((xTaskGetTickCount() - time_begin) < (timeout_ms / portTICK_PERIOD_MS)) {
@@ -1617,7 +2306,7 @@ static std::shared_ptr<PtrBuffer::Slot> sendTaggedCommand(const char* body, size
         // A plain unsigned `<=` with no mutation is both correct and simpler
         // - PTR_BUFFER_SIZE is only 3, so re-scanning the whole ring every
         // 5ms costs nothing.
-        auto it = std::find_if(slots.begin(), slots.end(), [&](std::shared_ptr<PtrBuffer::Slot> p) {
+        auto it = std::find_if(slots.begin(), slots.end(), [&](const SlotRef& p) {
             // pushPBSlot() assigns p_slot->id = PB.id *before* incrementing
             // PB.id (see its own code) - so the very next slot pushed after
             // `last_id = PB.id` was captured above gets an id exactly equal
@@ -1652,35 +2341,72 @@ static std::shared_ptr<PtrBuffer::Slot> sendTaggedCommand(const char* body, size
     xSemaphoreGive(PB.mutex);
 
     if (++s_consecutive_at_timeouts >= WE2_RESYNC_TIMEOUT_THRESHOLD) {
-        log_w("sendTaggedCommand: %u consecutive AT reply timeouts - assuming WE2 "
-              "rebooted independently and lost UART1 sync, re-arming probe handshake...",
-              (unsigned)s_consecutive_at_timeouts);
-        s_we2_uart1_synced        = false;
-        s_consecutive_at_timeouts = 0;
-        // Whatever's sitting in fetchFramedMessages()'s buffer is now stale
-        // (mid-parse of a reply that's never coming) - drop it so a dangling
-        // partial pattern can't delay recognizing real traffic once WE2
-        // actually reconnects and pollWe2Uart1Handshake() hands the line back.
-        s_fetch_len = 0;
+        uint32_t silence_ms   = millis() - s_last_uart1_rx_ms;
+        bool     really_silent = silence_ms >= WE2_RESYNC_SILENCE_MS;
+        // 2026-07-17: hardware-confirmed gap in the silence-gated check just
+        // below - if UART1 traffic (audio/bbox) keeps trickling in but the
+        // SPECIFIC awaited reply never does (observed: WE2-side task
+        // starvation under sustained audio load can apparently starve its
+        // own command-reply path this badly), silence_ms never crosses
+        // WE2_RESYNC_SILENCE_MS and this resync path never fires *at all* -
+        // s_consecutive_at_timeouts climbed past 15 in one hardware test
+        // with zero recovery until the ESP32 itself was hard-reset. The
+        // silence check is right to distrust a LOW count (2 timeouts is
+        // nowhere near enough evidence under normal congestion), but must
+        // not be trusted to protect against an unbounded stuck state either
+        // - this hard ceiling is the same "just get it moving again" escape
+        // hatch the pre-2026-07-17 logic always had, now only reached after
+        // real, sustained failure instead of on every transient hiccup.
+        bool many_timeouts = s_consecutive_at_timeouts >= WE2_RESYNC_HARD_CEILING;
+        if (really_silent || many_timeouts) {
+            log_w("sendTaggedCommand: %u consecutive AT reply timeouts (silent for "
+                  "%ums, %s) - re-arming probe handshake...",
+                  (unsigned)s_consecutive_at_timeouts, (unsigned)silence_ms,
+                  really_silent ? "UART1 genuinely silent" : "hard ceiling reached despite traffic");
+            s_we2_uart1_synced        = false;
+            s_consecutive_at_timeouts = 0;
+            // Whatever's sitting in fetchFramedMessages()'s buffer is now stale
+            // (mid-parse of a reply that's never coming) - drop it so a dangling
+            // partial pattern can't delay recognizing real traffic once WE2
+            // actually reconnects and pollWe2Uart1Handshake() hands the line back.
+            s_fetch_len = 0;
+        } else {
+            // 2026-07-17: real UART1 traffic within WE2_RESYNC_SILENCE_MS means
+            // WE2 is still alive and still on UART1 - this specific reply is
+            // just queued behind other traffic (bbox/audio), not evidence of a
+            // reboot. Don't disrupt the handshake state over it - just let the
+            // caller's own timeout (it'll report failure to its HTTP client)
+            // handle this one reply going missing, and keep counting towards
+            // the threshold (both this one and the hard ceiling above) in case
+            // UART1 genuinely does go silent, or the stuck state persists long
+            // enough to justify forcing a resync anyway.
+            log_w("sendTaggedCommand: %u consecutive AT reply timeouts but UART1 "
+                  "traffic seen %ums ago (< %ums) - WE2 still alive, NOT "
+                  "re-arming probe handshake yet (likely congestion, not a reboot)",
+                  (unsigned)s_consecutive_at_timeouts, (unsigned)silence_ms,
+                  (unsigned)WE2_RESYNC_SILENCE_MS);
+        }
     }
-    return nullptr;
+    return SlotRef();  // SlotRef's pointer ctor is `explicit`, so a bare
+                        // `return nullptr;` (fine for shared_ptr) won't
+                        // implicitly convert here - construct the empty/
+                        // null ref directly instead.
 }
 
-/* 2026-07-11: called from stream_result_handler()/stream_audio_handler() the
- * moment httpd_resp_send_chunk() first fails - that only happens once the
- * client's TCP connection is actually gone, so this is the "client
- * disconnected unexpectedly, self-close the WE2 stream" behavior (per
- * explicit direction: no browser UI to click a stop button anymore, so
+/* 2026-07-11: called from disconnectStreamClient() the moment
+ * stream_data_handler()'s httpd_resp_send_chunk() first fails - that only
+ * happens once the client's TCP connection is actually gone, so this is the
+ * "client disconnected unexpectedly, self-close the WE2 stream" behavior
+ * (per explicit direction: no browser UI to click a stop button anymore, so
  * nothing else would ever tell WE2 to stop if a client just vanishes).
  * Best-effort and short timeout - the caller is already tearing down its own
  * connection either way, this shouldn't hold that up waiting for a reply
- * that doesn't matter to it. Same AT+BREAK-stops-both caveat as camera_stop_
- * handler()/audio_stop_handler(): if a *different* client still has the
- * other stream (camera vs audio) open, this stops that one too - there's no
- * separate per-stream stop in WE2's AT protocol. */
+ * that doesn't matter to it. */
 // 2026-07-11: defensive debounce - hardware testing showed something (root
-// cause not yet confirmed) can drive stream_result_handler()/stream_audio_
-// handler() into calling this back-to-back at ~10-15ms intervals, and each
+// cause not yet confirmed) could drive this into being called back-to-back
+// at ~10-15ms intervals (from the era when /stream/result and /stream/audio
+// were still two separate connections/tasks racing each other - see
+// data_httpd's own comment on the 2026-07-18 merge), and each
 // call blocks its own task for up to 1s waiting on a reply, which was
 // enough to make the whole board unresponsive (no serial output, HTTP
 // dead, only the underlying WiFi/network stack still answering ICMP).
@@ -1696,14 +2422,31 @@ static void sendBreakBestEffort() {
     static bool        s_sent_once   = false;
     const TickType_t   cooldown_tick = pdMS_TO_TICKS(2000);
 
+    // 2026-07-18: this debounce's check-then-set on s_last_sent/s_sent_once
+    // was itself a TOCTOU race once result_httpd's and audio_httpd's worker
+    // tasks could both call this at nearly the same instant (both streams
+    // timing out together under combined load) - two callers could each see
+    // "not within cooldown" before either updated the statics, both fall
+    // through, and both call sendTaggedCommand() back to back. That's now
+    // safe re: I2C corruption (sendTaggedCommand() serializes itself via
+    // s_cmd_mutex - see its own comment), but still means BREAK could be
+    // sent twice in a row for no reason, and the second call blocks its
+    // caller's task for a full timeout waiting on a reply that was never
+    // going to arrive differently. Guard the check+update as one atomic
+    // step. Deliberately released BEFORE calling sendTaggedCommand() (not
+    // held across it) - s_cmd_mutex isn't a recursive mutex, and
+    // sendTaggedCommand() takes that lock itself.
+    xSemaphoreTake(s_cmd_mutex, portMAX_DELAY);
     TickType_t now = xTaskGetTickCount();
     if (s_sent_once && (now - s_last_sent) < cooldown_tick) {
+        xSemaphoreGive(s_cmd_mutex);
         log_w("sendBreakBestEffort: suppressed (last sent %lums ago)",
               (unsigned long)((now - s_last_sent) * portTICK_PERIOD_MS));
         return;
     }
     s_last_sent = now;
     s_sent_once = true;
+    xSemaphoreGive(s_cmd_mutex);
 
     char cmd_tag_buf[32] = {0};
     sendTaggedCommand(body, strlen(body), cmd_tag_buf, sizeof(cmd_tag_buf), 1000);
@@ -1757,7 +2500,7 @@ static esp_err_t command_handler(httpd_req_t* req) {
     free(qry_buf);
 
     char                              cmd_tag_buf[32] = {0};
-    std::shared_ptr<PtrBuffer::Slot>  slot = sendTaggedCommand(cmd_buf, cmd_size, cmd_tag_buf, sizeof(cmd_tag_buf));
+    SlotRef                           slot = sendTaggedCommand(cmd_buf, cmd_size, cmd_tag_buf, sizeof(cmd_tag_buf));
     free(cmd_buf);
 
     if (slot == nullptr) {
@@ -1888,6 +2631,28 @@ static esp_err_t camera_stop_handler(httpd_req_t* req) {
     return httpd_resp_send(req, (const char*)slot->data, slot->size);
 }
 
+/* TEMP DIAGNOSTIC (2026-07-17): lets a test script poll ESP32-side heap over
+ * HTTP/curl instead of the USB-CDC debug console - the console has proven
+ * unreliable for long/multi-cycle tests this session (see
+ * esp32_camera_web_server_bridge memory: it can go silent for reasons
+ * unrelated to whether the board itself is healthy), while `curl` against
+ * this same board has stayed reliable across every test so far. No AT
+ * command involved - purely local ESP32 heap state, doesn't touch WE2 at
+ * all, so this alone should never contend with anything on the I2C/UART
+ * side. Remove once the heap investigation wraps up. */
+static esp_err_t heap_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
+    char buf[96];
+    int  len = snprintf(buf, sizeof(buf), "{\"free\": %u, \"largest\": %u}",
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, buf, len);
+}
+
 /* AT+ASR=<rate> then AT+ASAMPLE=-1 - starts the DMIC/PDM audio stream at the
  * given rate (16000 or 32000 only - the WE2 firmware rejects anything else).
  * Query params: rate=16000|32000, default 16000. This app doesn't consume
@@ -1961,6 +2726,15 @@ void startCameraServer() {
     httpd_config_t config   = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;
     config.stack_size       = 10240;
+    // 2026-07-17: see the streaming instances' identical comment below - a
+    // stalled/vanished client on this control-plane server (camera/audio
+    // start-stop, /command) can leave a worker occupied for HTTPD_DEFAULT_
+    // CONFIG()'s full 5s default before the socket layer itself gives up,
+    // on top of whatever client_gone()-based app-level detection exists.
+    // Every command here is a short request/reply, never a legitimate
+    // multi-second transfer, so 3s is still generous.
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 3;
 
     httpd_uri_t command_uri = {.uri      = "/command",
                                .method   = HTTP_GET,
@@ -2014,6 +2788,18 @@ void startCameraServer() {
 #endif
     };
 
+    httpd_uri_t heap_uri = {.uri      = "/heap",
+                            .method   = HTTP_GET,
+                            .handler  = heap_handler,
+                            .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+                            ,
+                            .is_websocket             = true,
+                            .handle_ws_control_frames = false,
+                            .supported_subprotocol    = NULL
+#endif
+    };
+
     httpd_uri_t audio_start_uri = {.uri      = "/audio/start",
                                    .method   = HTTP_GET,
                                    .handler  = audio_start_handler,
@@ -2038,27 +2824,15 @@ void startCameraServer() {
 #endif
     };
 
-    httpd_uri_t stream_result_uri = {.uri      = "/stream/result",
-                                     .method   = HTTP_GET,
-                                     .handler  = stream_result_handler,
-                                     .user_ctx = NULL
+    httpd_uri_t stream_data_uri = {.uri      = "/stream/data",
+                                   .method   = HTTP_GET,
+                                   .handler  = stream_data_handler,
+                                   .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-                                     ,
-                                     .is_websocket             = true,
-                                     .handle_ws_control_frames = false,
-                                     .supported_subprotocol    = NULL
-#endif
-    };
-
-    httpd_uri_t stream_audio_uri = {.uri      = "/stream/audio",
-                                    .method   = HTTP_GET,
-                                    .handler  = stream_audio_handler,
-                                    .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-                                    ,
-                                    .is_websocket             = true,
-                                    .handle_ws_control_frames = false,
-                                    .supported_subprotocol    = NULL
+                                   ,
+                                   .is_websocket             = true,
+                                   .handle_ws_control_frames = false,
+                                   .supported_subprotocol    = NULL
 #endif
     };
 
@@ -2072,6 +2846,7 @@ void startCameraServer() {
         ret |= httpd_register_uri_handler(web_httpd, &command_uri);
         ret |= httpd_register_uri_handler(web_httpd, &camera_start_uri);
         ret |= httpd_register_uri_handler(web_httpd, &camera_stop_uri);
+        ret |= httpd_register_uri_handler(web_httpd, &heap_uri);
         ret |= httpd_register_uri_handler(web_httpd, &audio_start_uri);
         ret |= httpd_register_uri_handler(web_httpd, &audio_stop_uri);
     }
@@ -2083,49 +2858,49 @@ void startCameraServer() {
         }
     }
 
-    // 2026-07-12: two separate instances (see result_httpd/audio_httpd's
-    // own comment for why) instead of one shared stream_httpd - each needs
-    // its own smaller stack_size, not the control-plane web_httpd's 10240
-    // (that one parses AT command JSON replies; these are plain relay
-    // loops with modest locals).
+    // 2026-07-18: ONE instance (`data_httpd`) instead of the former two
+    // (result_httpd/audio_httpd) - see data_httpd's own comment for why
+    // (simultaneous dual-accept heap spike root-caused this session).
+    // Needs its own smaller stack_size, not the control-plane web_httpd's
+    // 10240 (that one parses AT command JSON replies; this is a relay loop
+    // with modest locals).
     //
-    // max_open_sockets also lowered from HTTPD_DEFAULT_CONFIG()'s default
-    // of 7 (per instance!) down to 2 - each only ever needs to serve one
-    // client at a time by design (single-client deployment, one connection
-    // per stream type).
+    // 2026-07-17: was 2 (lowered from HTTPD_DEFAULT_CONFIG()'s default of 7
+    // on the reasoning "only ever needs to serve one client at a time by
+    // design"). Raised to 4: that reasoning breaks down exactly when
+    // client_gone()'s dead-peer detection is slow to notice a client that
+    // vanished without a clean FIN (confirmed on hardware this session - a
+    // client that timed out client-side, e.g. a test script's own read
+    // timeout without a clean close(), left a zombie occupying a slot for
+    // an extended period) - with only 2 slots, a single zombie halves
+    // capacity and a second one exhausts it entirely, permanently locking
+    // out every subsequent real client until a full ESP32 reset. More
+    // headroom directly mitigates this regardless of whether the deeper
+    // dead-peer-detection timing issue itself ever gets root-caused.
     config.max_uri_handlers  = 1;
-    config.max_open_sockets  = 2;
+    config.max_open_sockets  = 4;
+    // Force the underlying socket layer to give up on a stalled peer
+    // faster than HTTPD_DEFAULT_CONFIG()'s 5s default - this is a
+    // low-latency streaming endpoint (audio chunks every ~125ms when
+    // active), no legitimate send/recv should ever need close to 5s.
+    config.recv_wait_timeout = 3;
+    config.send_wait_timeout = 3;
 
     config.server_port = 8081;
     config.ctrl_port   = 8081;
-    // 2026-07-12: bumped 4096 -> 6144. stream_result_handler() now has a
-    // real stack-local, `BboxEntry entries[BBOX_RING_SLOTS]` - 20 x
+    // 2026-07-12: bumped 4096 -> 6144. stream_data_handler() has a real
+    // stack-local, `BboxEntry bbox_entries[BBOX_RING_SLOTS]` - 20 x
     // sizeof(BboxEntry) (48B, alignment-padded - see BboxEntry's own
-    // comment) = 960B, about a quarter of the old 4096B budget on its own -
-    // the "no large locals" assumption this stack size was originally
-    // sized under (see stream_audio_handler's identical comment, still
-    // true for that one) no longer holds here.
+    // comment) = 960B - plus a small `std::vector` for AUDIO's pending
+    // slots (stack-resident header only, ~24-32B; the actual slot data is
+    // heap/pool-backed, not on this stack) - comfortable margin either way.
     config.stack_size  = 6144;
-    log_i("Starting result stream server on port: '%d'", config.server_port);
-    if ((ret = httpd_start(&result_httpd, &config)) == ESP_OK) {
-        ret |= httpd_register_uri_handler(result_httpd, &stream_result_uri);
+    log_i("Starting data stream server on port: '%d'", config.server_port);
+    if ((ret = httpd_start(&data_httpd, &config)) == ESP_OK) {
+        ret |= httpd_register_uri_handler(data_httpd, &stream_data_uri);
     }
     if (ret != ESP_OK) {
-        log_e("Failed to start result stream server, code '0x%x' ...", ret);
-        while (true) {
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-        }
-    }
-
-    config.server_port = 8082;
-    config.ctrl_port   = 8082;
-    config.stack_size  = 4096;  // stream_audio_handler: plain binary relay, no large locals
-    log_i("Starting audio stream server on port: '%d'", config.server_port);
-    if ((ret = httpd_start(&audio_httpd, &config)) == ESP_OK) {
-        ret |= httpd_register_uri_handler(audio_httpd, &stream_audio_uri);
-    }
-    if (ret != ESP_OK) {
-        log_e("Failed to start audio stream server, code '0x%x' ...", ret);
+        log_e("Failed to start data stream server, code '0x%x' ...", ret);
         while (true) {
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
