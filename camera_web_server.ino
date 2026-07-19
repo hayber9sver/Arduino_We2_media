@@ -53,6 +53,7 @@ void setup() {
 
     startRemoteProxy(PROTO_UART);
     initI2CCommandChannel();
+    initServoMotor();
     startCameraServer();
 
     Serial.print("Camera Ready! Use 'http://");

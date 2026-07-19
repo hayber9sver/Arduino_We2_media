@@ -315,15 +315,50 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
     signal.signal(signal.SIGTERM, handle_sigterm)
     signal.signal(signal.SIGINT, handle_sigterm)
 
-    def start_with_retries(url, attempts=5, delay=2):
+    def start_with_retries(url, attempts=5, delay=2, recover_url=None):
         """The ESP32C3's single-threaded httpd can be briefly unresponsive
         right after a fresh flash/reset (UART1 handshake with WE2 still
         settling - see esp32_camera_web_server_bridge memory). A single
         timeout here used to crash the whole background process (unhandled
         exception -> process exits, leaving nothing running) - retry a few
-        times before actually giving up."""
+        times before actually giving up.
+
+        2026-07-19: hardware-verified against real WE2 that blindly retrying
+        a *start* command (AT+INVOKE/AT+ASR) is actively dangerous if WE2 is
+        already mid-invoke from an earlier attempt whose reply never made it
+        back (e.g. the previous attempt's own timeout) - sending a second
+        AT+INVOKE while WE2 hasn't acknowledged the first one hangs the
+        ESP32's entire HTTP stack solid (every endpoint, not just this one)
+        and needs a hard power-cycle of BOTH boards to recover (WE2 keeps
+        streaming through an ESP32-only reset, then floods/wedges the fresh
+        boot's UART1 handshake). If recover_url is given, it's hit
+        (best-effort, errors ignored - if the board's already this wedged,
+        the real attempt below will surface it) before every RETRY
+        (attempt 2+), to force a clean stopped state before re-sending a
+        start command that might otherwise collide with an earlier
+        attempt's still-in-flight one.
+
+        2026-07-19: NOT before attempt 1 anymore (was) - hardware-verified
+        that stop-then-start (AT+BREAK immediately followed by AT+SENSOR/
+        AT+INVOKE, which power-cycles the camera sensor and reconfigures
+        MIPI) is real stress on the sensor/MIPI hardware, and this
+        project's own test scripts calling it on every single capture
+        start - even when nothing was actually running yet - is suspected
+        of contributing to WE2 spontaneously rebooting mid-session over the
+        course of a long test session. Skipping the pointless stop-when-
+        nothing-is-running case on the common-path first attempt cuts a
+        large fraction of that cycling without losing the protection this
+        exists for (which only matters from the second attempt onward, when
+        a previous attempt might have left WE2 in a real half-started
+        state)."""
         last_err = None
         for attempt in range(1, attempts + 1):
+            if recover_url is not None and attempt > 1:
+                try:
+                    http_get(recover_url, timeout=5)
+                except Exception:
+                    pass
+                time.sleep(0.5)  # let WE2/ESP32 settle after BREAK before re-invoking
             try:
                 return http_get(url, timeout=8)
             except Exception as e:
@@ -337,12 +372,16 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
     # side serializes AT-command sends across a single mutex regardless
     # (see app_httpd.cpp's s_cmd_mutex), so firing these concurrently from
     # two client threads would only queue up there, not actually save time.
+    # recover_url=/camera/stop on both - AT+BREAK stops whichever of
+    # camera/audio happens to be running (see its own comment further down),
+    # so it's the right recovery action before either start command.
     if want_camera:
         log(f"starting camera / AI inference (resolution={resolution})")
-        start_with_retries(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0")
+        start_with_retries(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0",
+                            recover_url=base + "/camera/stop")
     if want_audio:
         log(f"starting audio (rate={rate})")
-        start_with_retries(base + f"/audio/start?rate={rate}")
+        start_with_retries(base + f"/audio/start?rate={rate}", recover_url=base + "/camera/stop")
 
     # 2026-07-18: ONE reader thread/connection now regardless of want_camera/
     # want_audio - see read_data_stream()'s own comment. It simply won't see

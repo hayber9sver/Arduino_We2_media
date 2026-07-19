@@ -11,4 +11,10 @@ enum Proto {
 // see app_httpd.cpp's own comment above its definition.
 void initI2CCommandChannel();
 
+// 2026-07-19: PCA9685 (same I2C bus as initI2CCommandChannel() above) ->
+// SG92R servo on channel 0. Must be called AFTER initI2CCommandChannel(),
+// which owns Wire.begin() for this bus - see app_httpd.cpp's own comment
+// above its definition.
+void initServoMotor();
+
 #endif
