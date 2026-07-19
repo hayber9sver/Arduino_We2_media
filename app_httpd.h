@@ -17,4 +17,17 @@ void initI2CCommandChannel();
 // above its definition.
 void initServoMotor();
 
+// 2026-07-19: ST7735 128x128 SPI status display - shows WiFi IP and whether
+// a /stream/data client is connected. Must be called AFTER startRemoteProxy()
+// (shares DISPLAY_DC_PIN/D3 with AI.begin()'s one-shot WE2 reset pulse - see
+// app_httpd.cpp's own comment above initDisplay()'s definition), and before
+// displayShowIP()/displayShowClientStatus() are ever called (both silently
+// no-op until initDisplay() has run).
+void initDisplay();
+void displayShowIP(const char* ip);
+void displayShowClientStatus(bool connected);
+// angle < 0 means "no PCA9685 responding" - shown as "--" instead of a
+// number. See app_httpd.cpp's own comment above this function's definition.
+void displayShowMotorAngle(int angle);
+
 #endif

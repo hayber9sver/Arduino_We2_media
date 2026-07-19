@@ -25,6 +25,8 @@
 #include <Preferences.h>
 #include <Seeed_Arduino_SSCMA.h>
 #include <Wire.h>
+
+#include "ST7735_XIAO.h"
 #include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <freertos/semphr.h>
@@ -1052,6 +1054,10 @@ static int stepServoAngle(int delta) {
     }
     s_servo_angle.store(angle);
     s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, angle);
+    // "--" (not a possibly-misleading number) if there's no PCA9685 to
+    // actually be holding this position - matches s_servo_available's own
+    // gating of the real PWM write just above.
+    displayShowMotorAngle(s_servo_available ? angle : -1);
     return angle;
 }
 
@@ -1097,6 +1103,7 @@ void initServoMotor() {
     }
     if (err != 0) {
         log_w("initServoMotor: PCA9685 not responding after retries (I2C err %u) - servo control disabled", err);
+        displayShowMotorAngle(-1);
         return;
     }
     delay(5);
@@ -1118,6 +1125,110 @@ void initServoMotor() {
     s_servo_angle.store(SERVO_BOOT_ANGLE);
     s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, SERVO_BOOT_ANGLE);
     s_servo_available = true;
+    displayShowMotorAngle(SERVO_BOOT_ANGLE);
+}
+
+// ---------------------------------------------------------------------------
+// 2026-07-19: ST7735 128x128 SPI status display (user-supplied, hardware-
+// verified ST7735_XIAO.cpp/.h - see that file for the actual panel driver).
+// Shows the board's WiFi IP and whether a /stream/data client is currently
+// connected. CS/DC/RST are plain GPIO (per ST7735_XIAO's own design, not
+// hardware-auto CS) so any pins work; SCK/MOSI use the board's default
+// hardware SPI pins (D8/D10 on XIAO ESP32C3) since nothing else on this
+// board uses hardware SPI (startRemoteProxy()'s PROTO_SPI case is dead code
+// - PROTO_UART is what's actually selected).
+//
+// Pin note: DISPLAY_DC_PIN (D3) is the same pin AI.begin(&atSerial, D3)
+// (see startRemoteProxy()'s PROTO_UART case) uses as WE2's reset line - not
+// a real conflict since that use is a one-shot pulse-then-INPUT during
+// startRemoteProxy() early in setup(), and initDisplay() is only called
+// afterward (see camera_web_server.ino's setup()), by which point D3 is
+// already idle/available for the display to drive as an output.
+#define DISPLAY_CS_PIN  (D5)
+#define DISPLAY_DC_PIN  (D3)
+#define DISPLAY_RST_PIN (D2)
+
+#define DISPLAY_COLOR_BLACK  (0x0000)
+#define DISPLAY_COLOR_WHITE  (0xFFFF)
+#define DISPLAY_COLOR_GREEN  (0x07E0)
+#define DISPLAY_COLOR_YELLOW (0xFFE0)
+
+static ST7735_XIAO   s_display(DISPLAY_CS_PIN, DISPLAY_DC_PIN, DISPLAY_RST_PIN);
+static bool          s_display_ready = false;
+// Guards SPI transactions against interleaving from concurrent callers -
+// displayShowClientStatus() is called from httpd worker tasks (stream
+// connect/disconnect), displayShowIP() from the main task at boot; the
+// ST7735_XIAO driver itself has no locking of its own (matches this
+// codebase's existing pattern of guarding shared-bus access at the call
+// site - see s_cmd_mutex's own comment).
+static SemaphoreHandle_t s_display_mutex = NULL;
+
+void initDisplay() {
+    s_display_mutex = xSemaphoreCreateMutex();
+    s_display.begin();
+    s_display.fillScreen(DISPLAY_COLOR_BLACK);
+    s_display.drawText(2, 2, "WiFi IP:", DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
+    s_display.drawText(2, 40, "Client:", DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
+    s_display.drawText(2, 78, "Motor:", DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
+    s_display_ready = true;
+    // Boot default, matches s_data_stream_clients' own initial value (0) -
+    // updated for real once startCameraServer() is up and a client can
+    // actually connect.
+    s_display.drawText(2, 52, "WAITING   ", DISPLAY_COLOR_YELLOW, 2, DISPLAY_COLOR_BLACK, true);
+    // Placeholder until initServoMotor() (called after initDisplay() in
+    // camera_web_server.ino's setup()) determines the real angle - or
+    // decides the PCA9685 isn't responding at all, see
+    // displayShowMotorAngle()'s own negative-angle case.
+    s_display.drawText(2, 90, "--       ", DISPLAY_COLOR_WHITE, 2, DISPLAY_COLOR_BLACK, true);
+}
+
+void displayShowIP(const char* ip) {
+    if (!s_display_ready) {
+        return;
+    }
+    MutexGuard lock(s_display_mutex);
+    // Fixed-width blank-pad (up to 21 chars comfortably fits this 128px-wide
+    // panel at text size 1) so a shorter new IP fully overwrites a longer
+    // old one - same reasoning as displayShowClientStatus()'s own padding.
+    char buf[22];
+    snprintf(buf, sizeof(buf), "%-21s", ip);
+    s_display.drawText(2, 14, buf, DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
+}
+
+void displayShowClientStatus(bool connected) {
+    if (!s_display_ready) {
+        return;
+    }
+    MutexGuard lock(s_display_mutex);
+    // Blank-padded to a fixed width ("CONNECTED " is the longest) so
+    // switching between the two never leaves stray characters from the
+    // previous, longer string un-overwritten.
+    if (connected) {
+        s_display.drawText(2, 52, "CONNECTED ", DISPLAY_COLOR_GREEN, 2, DISPLAY_COLOR_BLACK, true);
+    } else {
+        s_display.drawText(2, 52, "WAITING   ", DISPLAY_COLOR_YELLOW, 2, DISPLAY_COLOR_BLACK, true);
+    }
+}
+
+// angle < 0 means "no PCA9685 responding" (see s_servo_available) - shown
+// as "--" rather than a number that would otherwise look like a real,
+// currently-held position.
+void displayShowMotorAngle(int angle) {
+    if (!s_display_ready) {
+        return;
+    }
+    MutexGuard lock(s_display_mutex);
+    char text[8];
+    if (angle < 0) {
+        snprintf(text, sizeof(text), "--");
+    } else {
+        snprintf(text, sizeof(text), "%d deg", angle);
+    }
+    // Blank-padded to a fixed width ("180 deg" is the longest possible
+    // value) so a shorter new value never leaves stray characters behind.
+    char buf[10];
+    snprintf(buf, sizeof(buf), "%-9s", text);
+    s_display.drawText(2, 90, buf, DISPLAY_COLOR_WHITE, 2, DISPLAY_COLOR_BLACK, true);
 }
 
 inline uint16_t getMsgType(const char* resp, size_t len) {
@@ -1912,6 +2023,7 @@ static void disconnectStreamClient(const char* reason) {
           (int)s_data_stream_clients.load(), reason);
     if (s_data_stream_clients.load() <= 0) {
         sendBreakBestEffort();
+        displayShowClientStatus(false);
     }
 }
 
@@ -2059,6 +2171,7 @@ static esp_err_t stream_data_handler(httpd_req_t* req) {
     // See s_data_stream_clients' own comment - pushPBSlot() checks this to
     // decide whether AUDIO backlog is worth retaining at all.
     s_data_stream_clients += 1;
+    displayShowClientStatus(true);
     // TEMP DIAGNOSTIC (2026-07-17) - see disconnectStreamClient()'s comment.
     log_w("DBG stream_data_handler CONNECT heap: free=%u largest=%u",
           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),

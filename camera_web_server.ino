@@ -52,6 +52,11 @@ void setup() {
     Serial.println("WiFi connected");
 
     startRemoteProxy(PROTO_UART);
+    // Must come after startRemoteProxy(PROTO_UART) - shares DISPLAY_DC_PIN
+    // (D3) with AI.begin()'s one-shot WE2 reset pulse in that call, see
+    // initDisplay()'s own comment in app_httpd.cpp.
+    initDisplay();
+    displayShowIP(WiFi.localIP().toString().c_str());
     initI2CCommandChannel();
     initServoMotor();
     startCameraServer();
