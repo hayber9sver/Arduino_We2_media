@@ -169,26 +169,54 @@ def _graceful_close_response(resp):
     # alone would never fire as long as new data keeps arriving within each
     # window (same bug/fix already found the hard way in this session's
     # scratchpad coverage_test.py).
+    #
+    # 2026-07-19: drains the RAW socket (sock.recv()), NOT resp.read() (was)
+    # - hardware-confirmed this was a real gap: resp.read() goes through
+    # http.client's own chunked-transfer parser, and when the close is
+    # being forced BECAUSE that parser already choked (e.g. an
+    # IncompleteRead exception, the actual case seen in practice - see
+    # read_data_stream()'s own comment), calling resp.read() again on the
+    # same broken parser just raises immediately, exiting this loop after
+    # draining zero bytes - the kernel-level socket receive buffer is left
+    # completely undrained regardless of how long the deadline below is,
+    # and shutdown(SHUT_RDWR) does not itself discard that buffer. Closing
+    # a socket with unread bytes still sitting in it is exactly the
+    # condition that makes the OS send an abortive RST instead of a clean
+    # FIN - so this "drain" was a no-op in precisely the case it was
+    # written for. Reading straight off the socket bypasses the broken
+    # HTTP-layer parser entirely.
     drain_deadline = time.time() + 1.0
-    while time.time() < drain_deadline:
-        try:
-            chunk = resp.read(65536)
-        except Exception:
-            break
-        if not chunk:
-            break
     if sock is not None:
+        while time.time() < drain_deadline:
+            try:
+                chunk = sock.recv(65536)
+            except Exception:
+                break
+            if not chunk:
+                break
         try:
             sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+    else:
+        # Fallback for the (believed rare) case the internal attribute
+        # lookup above fails - no raw socket to drain directly, so this is
+        # the best remaining effort even though it has the same "no-op
+        # after a broken parser" limitation described above.
+        while time.time() < drain_deadline:
+            try:
+                chunk = resp.read(65536)
+            except Exception:
+                break
+            if not chunk:
+                break
 
 
 # ---------------------------------------------------------------------------
 # Stream reader (single thread inside the background process)
 # ---------------------------------------------------------------------------
 
-def read_data_stream(base, results_path, wav_path, stop_event):
+def read_data_stream(base, results_path, wav_path, stop_event, resume_urls=None):
     """Pulls the MERGED stream off :8081/stream/data (see
     stream_data_handler() in app_httpd.cpp, 2026-07-18 - replaces what used
     to be two separate connections/threads, one per :8081/stream/result and
@@ -201,7 +229,21 @@ def read_data_stream(base, results_path, wav_path, stop_event):
     0xFF. CRC mismatches on audio are logged but not fatal, just dropped.
     Reconnects on any read error, or when the server itself closes the
     connection after ~10s of no new bbox/audio activity (its own deliberate
-    idle-timeout backstop, not an error)."""
+    idle-timeout backstop, not an error).
+
+    2026-07-19: resume_urls (if given) are re-hit, best-effort, before every
+    RECONNECT (not the first connection - the caller already ensured the
+    stream was started before this thread began). Hardware-confirmed
+    necessary: WE2's stream does not survive a /stream/data client
+    disconnecting, even a purely transient one (see sendBreakBestEffort()
+    in app_httpd.cpp - the last client dropping, for any reason, sends
+    AT+BREAK and stops camera+audio+invoke on WE2 entirely). Simply
+    reconnecting to /stream/data without re-issuing the start commands just
+    attaches to a socket that's never going to produce anything again -
+    root-caused this session as the actual reason a real capture run showed
+    ~0% audio coverage: the reconnect loop kept "succeeding" at the TCP
+    level (new connection accepted fine) while WE2 itself just sat idle,
+    cycling into the 10s idle-timeout backstop forever."""
     url = base.replace(":80", ":8081") if ":80" in base else base + ":8081"
     url += "/stream/data"
 
@@ -210,82 +252,202 @@ def read_data_stream(base, results_path, wav_path, stop_event):
     frame_count = 0
     crc_bad = 0
     bbox_count = 0
+    first_connect = True
+    last_flush_ts = 0.0  # see the out.flush() throttle further down
 
     with open(results_path, "a") as out:
         while not stop_event.is_set():
+            if not first_connect and resume_urls:
+                # 2026-07-20: was silent on success - only the except branch
+                # below ever logged anything, so a clean EOF (resp.read()
+                # returning b"") followed by a successful resume looked
+                # identical to "nothing happened" in this log, even though a
+                # full disconnect+resume cycle (including the AT+ASR/ASAMPLE
+                # I2C round-trip that turned out to matter for a separate
+                # investigation) had just occurred. Log the resume attempt
+                # itself so a quiet reconnect cycle is visible here too.
+                log(f"data reader: resuming stream ({len(resume_urls)} url(s)) after disconnect")
+                for resume_url in resume_urls:
+                    try:
+                        # 2026-07-19: was 8 - packet-capture-confirmed the
+                        # ESP32 side can legitimately take up to
+                        # RESULT_TIMEOUT_MS (8000ms) per AT command it
+                        # forwards to WE2, and camera_start_handler() alone
+                        # issues two of those sequentially (AT+SENSOR then
+                        # AT+INVOKE) - an 8s client timeout raced the
+                        # server's own worst case almost exactly, so the
+                        # client would give up (FIN) moments before the
+                        # server's (still in-flight) response arrived,
+                        # which the OS then answers with RST since the
+                        # client's socket is already gone - looked exactly
+                        # like a real disconnect in the logs, but was really
+                        # just "client didn't wait long enough". 30s gives
+                        # comfortable headroom above the worst realistic
+                        # case (two 8s AT waits plus retry/settle overhead).
+                        http_get(resume_url, timeout=30)
+                    except Exception as e:
+                        log(f"data reader: resume request to {resume_url} failed: {e}")
+                time.sleep(0.3)  # let WE2/ESP32 settle before the new /stream/data connects
+            first_connect = False
             try:
                 req = urllib.request.Request(url, headers={"Authorization": auth_header()})
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     buf = b""
-                    while not stop_event.is_set():
-                        chunk = resp.read(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        while True:
-                            if len(buf) < 4:
-                                break  # not enough to tell audio-magic from a JSON line's '{' yet
-                            if buf[:4] == AUDIO_MAGIC:
-                                if len(buf) < AUDIO_HEADER_LEN:
-                                    break
-                                rate, plen = struct.unpack_from("<II", buf, 4)
-                                channels, bits = buf[12], buf[13]
-                                total = AUDIO_HEADER_LEN + plen + AUDIO_CRC_LEN
-                                if len(buf) < total:
-                                    break
-                                payload = buf[AUDIO_HEADER_LEN:AUDIO_HEADER_LEN + plen]
-                                crc_recv = struct.unpack_from("<H", buf, AUDIO_HEADER_LEN + plen)[0]
-                                if crc16_maxim(payload) != crc_recv:
-                                    crc_bad += 1
+                    try:
+                        while not stop_event.is_set():
+                            # 2026-07-19: was 4096 - an audio frame alone is
+                            # 8018 bytes, so every single frame needed at
+                            # least 2 read() calls/syscalls to fully arrive,
+                            # and under bursty delivery this let the OS-level
+                            # socket receive buffer build up between calls
+                            # instead of being drained promptly - a plausible
+                            # contributor to the server-side "client too
+                            # slow"/backpressure timeouts seen under load.
+                            # 65536 matches _graceful_close_response()'s own
+                            # drain read size.
+                            # TEMP DIAGNOSTIC (2026-07-20): per-step timing to
+                            # find out whether THIS process is the "lagging
+                            # consumer" the ESP32 sees (hardware-confirmed:
+                            # ~2s of repeated EAGAIN/pool-exhaustion on the
+                            # server side, immediately followed by errno=104
+                            # and a server-initiated disconnect) - a slow
+                            # step in here would mean this loop wasn't
+                            # calling resp.read() often enough to keep the
+                            # socket drained, which is indistinguishable from
+                            # a slow network from the ESP32's point of view.
+                            # 30ms threshold is well under SO_SNDTIMEO's
+                            # 200ms so any real contributor shows up.
+                            _t0 = time.time()
+                            chunk = resp.read(65536)
+                            _dt = time.time() - _t0
+                            if _dt > 0.03:
+                                log(f"data reader: TIMING resp.read() took {_dt*1000:.0f}ms")
+                            if not chunk:
+                                break
+                            buf += chunk
+                            while True:
+                                if len(buf) < 4:
+                                    break  # not enough to tell audio-magic from a JSON line's '{' yet
+                                if buf[:4] == AUDIO_MAGIC:
+                                    if len(buf) < AUDIO_HEADER_LEN:
+                                        break
+                                    rate, plen = struct.unpack_from("<II", buf, 4)
+                                    channels, bits = buf[12], buf[13]
+                                    total = AUDIO_HEADER_LEN + plen + AUDIO_CRC_LEN
+                                    if len(buf) < total:
+                                        break
+                                    payload = buf[AUDIO_HEADER_LEN:AUDIO_HEADER_LEN + plen]
+                                    crc_recv = struct.unpack_from("<H", buf, AUDIO_HEADER_LEN + plen)[0]
+                                    _t0 = time.time()
+                                    crc_ok = crc16_maxim(payload) == crc_recv
+                                    _dt = time.time() - _t0
+                                    if _dt > 0.03:
+                                        log(f"data reader: TIMING crc16_maxim() took {_dt*1000:.0f}ms")
+                                    if not crc_ok:
+                                        crc_bad += 1
+                                    else:
+                                        if wav_writer is None:
+                                            wav_writer = wave.open(wav_path, "wb")
+                                            wav_writer.setnchannels(channels or 1)
+                                            wav_writer.setsampwidth((bits or 16) // 8)
+                                            wav_writer.setframerate(rate)
+                                            wav_rate = rate
+                                        if rate != wav_rate:
+                                            log(f"data reader: sample rate changed {wav_rate}->{rate} mid-stream, "
+                                                f"keeping {wav_rate} in the WAV header (rest of the file will play "
+                                                f"back at the wrong speed) - stop/restart the capture after AT+ASR "
+                                                f"changes")
+                                        _t0 = time.time()
+                                        wav_writer.writeframes(payload)
+                                        _dt = time.time() - _t0
+                                        if _dt > 0.03:
+                                            log(f"data reader: TIMING wav_writer.writeframes() took {_dt*1000:.0f}ms")
+                                        frame_count += 1
+                                    buf = buf[total:]
                                 else:
-                                    if wav_writer is None:
-                                        wav_writer = wave.open(wav_path, "wb")
-                                        wav_writer.setnchannels(channels or 1)
-                                        wav_writer.setsampwidth((bits or 16) // 8)
-                                        wav_writer.setframerate(rate)
-                                        wav_rate = rate
-                                    if rate != wav_rate:
-                                        log(f"data reader: sample rate changed {wav_rate}->{rate} mid-stream, "
-                                            f"keeping {wav_rate} in the WAV header (rest of the file will play "
-                                            f"back at the wrong speed) - stop/restart the capture after AT+ASR "
-                                            f"changes")
-                                    wav_writer.writeframes(payload)
-                                    frame_count += 1
-                                buf = buf[total:]
-                            else:
-                                idx = buf.find(b"\n")
-                                if idx < 0:
-                                    if len(buf) > 65536:
-                                        # not audio-magic and no line terminator found in 64KB -
-                                        # something's desynced (shouldn't happen with well-formed
-                                        # firmware output); drop the buffered garbage rather than
-                                        # growing it unboundedly.
-                                        log(f"data reader: {len(buf)} bytes buffered with no audio "
-                                            f"magic or line terminator - dropping and resyncing")
-                                        buf = b""
-                                    break
-                                line = buf[:idx].decode("utf-8", "replace").strip()
-                                buf = buf[idx + 1:]
-                                if line:
-                                    try:
-                                        entry = json.loads(line)
-                                        entry["_client_ts_ms"] = int(time.time() * 1000)
-                                        out.write(json.dumps(entry) + "\n")
-                                        out.flush()
-                                        bbox_count += 1
-                                    except json.JSONDecodeError as e:
-                                        log(f"data reader: malformed bbox line dropped ({e}): {line[:120]!r}")
-                    # 2026-07-19: drain before the `with` block's own close()
-                    # runs - see _graceful_close_response()'s own comment.
-                    # Reached whenever the inner loop above exits for any
-                    # reason (stop_event set, or the server itself closed
-                    # the connection) - in the stop_event case specifically,
-                    # the server is almost certainly still actively
-                    # streaming (it has no idea we're about to leave), so
-                    # there's very likely unread data sitting in the OS
-                    # receive buffer right now; closing on top of that sends
-                    # an abortive RST instead of a clean FIN.
-                    _graceful_close_response(resp)
+                                    idx = buf.find(b"\n")
+                                    if idx < 0:
+                                        if len(buf) > 65536:
+                                            # not audio-magic and no line terminator found in 64KB -
+                                            # something's desynced (shouldn't happen with well-formed
+                                            # firmware output); drop the buffered garbage rather than
+                                            # growing it unboundedly.
+                                            log(f"data reader: {len(buf)} bytes buffered with no audio "
+                                                f"magic or line terminator - dropping and resyncing")
+                                            buf = b""
+                                        break
+                                    line = buf[:idx].decode("utf-8", "replace").strip()
+                                    buf = buf[idx + 1:]
+                                    if line:
+                                        try:
+                                            _t0 = time.time()
+                                            entry = json.loads(line)
+                                            _dt = time.time() - _t0
+                                            if _dt > 0.03:
+                                                log(f"data reader: TIMING json.loads() took {_dt*1000:.0f}ms")
+                                            # 2026-07-19: a desynced/malformed
+                                            # buffer (more likely during the
+                                            # frequent reconnects this stream
+                                            # sees under load) can produce a
+                                            # stray line that's valid JSON but
+                                            # not an object (e.g. a bare
+                                            # number) - json.loads() won't
+                                            # raise for that, but indexed
+                                            # assignment below would
+                                            # (hardware-confirmed: 'int'
+                                            # object does not support item
+                                            # assignment). Not a real bbox
+                                            # batch either way - drop it.
+                                            if not isinstance(entry, dict):
+                                                log(f"data reader: bbox line decoded to non-object JSON "
+                                                    f"({type(entry).__name__}), dropping: {line[:120]!r}")
+                                                continue
+                                            entry["_client_ts_ms"] = int(time.time() * 1000)
+                                            _t0 = time.time()
+                                            out.write(json.dumps(entry) + "\n")
+                                            _dt = time.time() - _t0
+                                            if _dt > 0.03:
+                                                log(f"data reader: TIMING out.write() took {_dt*1000:.0f}ms")
+                                            # 2026-07-19: was an unconditional
+                                            # flush() on every single line - a
+                                            # synchronous disk I/O call inline
+                                            # with the read loop. Under a
+                                            # bbox burst this could stall the
+                                            # loop long enough to leave the OS
+                                            # socket receive buffer un-drained,
+                                            # plausibly contributing to the
+                                            # same server-side backpressure
+                                            # timeouts as the read-size fix
+                                            # above. Throttled to at most
+                                            # once/second instead - still
+                                            # bounds how much is lost if this
+                                            # process dies uncleanly, without
+                                            # paying the cost on every line.
+                                            now = time.time()
+                                            if now - last_flush_ts >= 1.0:
+                                                _t0 = time.time()
+                                                out.flush()
+                                                _dt = time.time() - _t0
+                                                if _dt > 0.03:
+                                                    log(f"data reader: TIMING out.flush() took {_dt*1000:.0f}ms")
+                                                last_flush_ts = now
+                                            bbox_count += 1
+                                        except json.JSONDecodeError as e:
+                                            log(f"data reader: malformed bbox line dropped ({e}): {line[:120]!r}")
+                    finally:
+                        # 2026-07-19: was reached only on a normal loop exit
+                        # (moved into `finally` so it also runs when the loop
+                        # above raises, e.g. IncompleteRead) - drain before
+                        # the `with` block's own close() runs. Closing a
+                        # socket that still has unread buffered data sends
+                        # an abortive RST instead of a clean FIN; hardware-
+                        # confirmed the ESP32 treats that RST as a real
+                        # client disconnect, which stops WE2's entire stream
+                        # (see sendBreakBestEffort() in app_httpd.cpp) - so
+                        # skipping this drain on the exception path was
+                        # directly responsible for turning a transient read
+                        # hiccup into a full stream outage.
+                        _graceful_close_response(resp)
             except Exception as e:
                 if not stop_event.is_set():
                     log(f"stream/data reader: {e} - reconnecting in 2s")
@@ -355,12 +517,20 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
         for attempt in range(1, attempts + 1):
             if recover_url is not None and attempt > 1:
                 try:
-                    http_get(recover_url, timeout=5)
+                    # 2026-07-19: was 5 - same reasoning as the main
+                    # attempt's timeout below (BREAK also goes through
+                    # sendTaggedCommand(), same up-to-8s worst case).
+                    http_get(recover_url, timeout=30)
                 except Exception:
                     pass
                 time.sleep(0.5)  # let WE2/ESP32 settle after BREAK before re-invoking
             try:
-                return http_get(url, timeout=8)
+                # 2026-07-19: was 8 - packet-capture-confirmed this raced
+                # the server's own worst-case RESULT_TIMEOUT_MS-driven
+                # response time almost exactly (camera_start_handler()
+                # alone can take up to 2x8s for AT+SENSOR+AT+INVOKE) -
+                # see resume_urls' identical fix above for the full story.
+                return http_get(url, timeout=30)
             except Exception as e:
                 last_err = e
                 log(f"start request to {url} failed (attempt {attempt}/{attempts}): {e}")
@@ -383,11 +553,21 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
         log(f"starting audio (rate={rate})")
         start_with_retries(base + f"/audio/start?rate={rate}", recover_url=base + "/camera/stop")
 
+    # 2026-07-19: re-issued (best-effort) before every RECONNECT inside
+    # read_data_stream() - see that function's own comment for why a
+    # reconnect alone isn't enough to actually resume WE2's stream.
+    resume_urls = []
+    if want_camera:
+        resume_urls.append(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0")
+    if want_audio:
+        resume_urls.append(base + f"/audio/start?rate={rate}")
+
     # 2026-07-18: ONE reader thread/connection now regardless of want_camera/
     # want_audio - see read_data_stream()'s own comment. It simply won't see
     # bbox lines if camera was never started, or audio frames if audio
     # wasn't, so this is correct for any combination of the two.
-    threads = [threading.Thread(target=read_data_stream, args=(base, results_path, wav_path, stop_event))]
+    threads = [threading.Thread(target=read_data_stream,
+                                 args=(base, results_path, wav_path, stop_event, resume_urls))]
 
     for t in threads:
         t.start()
@@ -398,7 +578,12 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
     # stop in WE2's AT protocol - see camera_stop_handler()'s comment in
     # app_httpd.cpp), so one call covers whichever we started.
     try:
-        http_get(base + "/camera/stop", timeout=5)
+        # 30s for the same reason as the /camera/start and /audio/start
+        # calls above: camera_stop_handler() also goes through
+        # sendTaggedCommand() (AT+BREAK), which can take up to
+        # RESULT_TIMEOUT_MS=8000ms on its own - a short client timeout here
+        # risks the same give-up-then-RST race the packet capture found.
+        http_get(base + "/camera/stop", timeout=30)
     except Exception as e:
         log(f"stop request failed (WE2 stream may still be running): {e}")
 

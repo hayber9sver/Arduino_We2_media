@@ -68,5 +68,6 @@ void setup() {
 
 void loop() {
     loopRemoteProxy();
+    servoRampPoll();
     delay(5);
 }

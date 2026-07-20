@@ -25,6 +25,8 @@
 #include <Preferences.h>
 #include <Seeed_Arduino_SSCMA.h>
 #include <Wire.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
 
 #include "ST7735_XIAO.h"
 #include <esp_heap_caps.h>
@@ -43,6 +45,7 @@
 
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
     #include <HardwareSerial.h>
@@ -959,6 +962,16 @@ void initI2CCommandChannel() {
 // only need to know the step direction, not an absolute target.
 static std::atomic<int> s_servo_angle(SERVO_BOOT_ANGLE);
 
+// 2026-07-20: target-angle tracking for motor_set_handler()/servoRampPoll()
+// - see servoRampPoll()'s own comment for why this exists (one HTTP call
+// sets this, a background poll steps toward it over time) instead of the
+// caller having to spam many /motor/left or /motor/right calls to sweep a
+// wide range, which was measured this session to add real s_cmd_mutex
+// contention against WE2 AT-command traffic under sustained sweeping (every
+// ~0.5-0.65s for the whole test) - see stepServoAngle()'s own comment on why
+// it shares that mutex with sendTaggedCommand()/sendBreakBestEffort().
+static std::atomic<int> s_servo_target_angle(SERVO_BOOT_ANGLE);
+
 // 2026-07-19: persists the last-commanded angle across power cycles
 // (hardware-verified bug: without this, initServoMotor()'s boot ramp always
 // started counting up from a hardcoded 0, so if the servo had last been
@@ -1059,6 +1072,38 @@ static int stepServoAngle(int delta) {
     // gating of the real PWM write just above.
     displayShowMotorAngle(s_servo_available ? angle : -1);
     return angle;
+}
+
+// 2026-07-20: non-blocking counterpart to rampServoTo() - that function (used
+// only at boot, see initServoMotor()) holds s_cmd_mutex for its ENTIRE
+// multi-step ramp, which is fine once at startup but would be a much worse
+// version of the exact contention problem this whole mechanism exists to
+// avoid if reused for a live "move slowly to X" request while AT-command
+// traffic is active. Call this from loop() instead: each call does AT MOST
+// one SERVO_RAMP_STEP_DEG step, taking s_cmd_mutex only for that one step's
+// read-modify-write + I2C write (same brief-hold pattern as
+// stepServoAngle(), which this largely mirrors), then returns - s_cmd_mutex
+// is never held across the pacing delay itself, so a long sweep now costs
+// one HTTP request instead of dozens and never blocks a pending AT command
+// for longer than a single 2-degree step.
+void servoRampPoll() {
+    static uint32_t s_last_step_ms = 0;
+    int              target        = s_servo_target_angle.load();
+    int              current       = s_servo_angle.load();
+    if (target == current) {
+        return;
+    }
+    uint32_t now_ms = millis();
+    if (now_ms - s_last_step_ms < SERVO_RAMP_STEP_DELAY_MS) {
+        return;
+    }
+    s_last_step_ms  = now_ms;
+    int delta       = (target > current) ? SERVO_RAMP_STEP_DEG : -SERVO_RAMP_STEP_DEG;
+    // Don't overshoot past target on the final step of a sweep.
+    if (abs(target - current) < abs(delta)) {
+        delta = target - current;
+    }
+    stepServoAngle(delta);
 }
 
 // Initializes the PCA9685 at 50Hz (standard analog-servo update rate) and
@@ -2073,6 +2118,61 @@ static bool client_gone(httpd_req_t* req) {
     return false;
 }
 
+// 2026-07-20: writev() with retry-until-complete-or-real-failure, used by
+// stream_data_handler()'s combined audio+bbox send (see that call site's own
+// comment for why it hand-rolls chunk framing instead of using
+// httpd_resp_send_chunk() per item). A single httpd_resp_send_chunk() call
+// loops internally until done or SO_SNDTIMEO fires once, reporting a clean
+// all-or-nothing result - sending several buffers back to back gives no
+// such guarantee, so a short partial write has to be retried on the
+// REMAINING unsent bytes here. Once ANY byte of a chunk has hit the wire,
+// the hex chunk-length already written is a promise to the client that
+// can't be walked back - so unlike the drop-before-sending path in the
+// caller (which can still cleanly skip a whole chunk before ever calling
+// this), a partial write here can only end in "eventually finish" or "give
+// up and force a disconnect" (returning false), never "drop and continue" -
+// the caller must treat false as a hard failure, not a droppable one,
+// regardless of what errno says.
+//
+// 2026-07-20: this was originally a single writev() call per attempt (true
+// scatter-gather, one syscall for the whole iovec array) - REVERTED after a
+// real build on this toolchain failed at link time with "undefined
+// reference to `writev'": the ESP32 Arduino core's lwIP sockets shim
+// doesn't implement it, confirmed by the linker, not just a missing
+// declaration. Falls back to sending each iovec entry with its own send()
+// call instead - still zero-copy (no memcpy of audio/bbox data), still one
+// hand-rolled chunk frame covering everything collected this pass instead
+// of routing each item through httpd_resp_send_chunk() (which itself does
+// up to 3 of its own internal sends per call - header line, payload,
+// trailing CRLF) - just N send() calls instead of 1 writev() call, not the
+// pure single-syscall version originally intended.
+static bool writev_retrying(int fd, struct iovec* iov, int iovcnt, uint32_t deadline_ms, int* out_errno) {
+    while (iovcnt > 0) {
+        errno     = 0;
+        ssize_t n = send(fd, iov[0].iov_base, iov[0].iov_len, 0);
+        *out_errno = errno;
+        if (n > 0) {
+            size_t remaining = (size_t)n;
+            if (remaining < iov[0].iov_len) {
+                iov[0].iov_base = (char*)iov[0].iov_base + remaining;
+                iov[0].iov_len -= remaining;
+            } else {
+                iov++;
+                iovcnt--;
+            }
+            continue;
+        }
+        if (*out_errno == EAGAIN || *out_errno == EWOULDBLOCK || *out_errno == ETIMEDOUT) {
+            if (millis() >= deadline_ms) {
+                return false;
+            }
+            continue;  // each attempt already bounded by the socket's own SO_SNDTIMEO
+        }
+        return false;  // real error (ECONNRESET, EPIPE, ENOTCONN, ...)
+    }
+    return true;
+}
+
 /* 2026-07-18: merged former stream_audio_handler()+stream_result_handler()
  * into ONE connection/handler/worker task - see s_data_stream_clients' own
  * comment for why (root-caused: two simultaneous NEW connections, one per
@@ -2194,6 +2294,11 @@ static esp_err_t stream_data_handler(httpd_req_t* req) {
     TickType_t idle_since               = xTaskGetTickCount();
     const TickType_t IDLE_TIMEOUT_TICKS = pdMS_TO_TICKS(10000);
     const char*       disconnect_reason  = "loop_exit_unexpected";  // see disconnectStreamClient()'s DBG comment
+    // 2026-07-19: see the idle-timeout check below (where this is read) -
+    // tracks s_last_uart1_rx_ms so a genuinely-alive-but-quiet WE2 (real
+    // traffic arriving, just nothing that lands in audio_pending/bbox_count)
+    // isn't treated the same as a dead one.
+    uint32_t last_seen_uart1_rx_ms = s_last_uart1_rx_ms;
 
     // 2026-07-18: pending audio/bbox queues now live OUTSIDE the outer
     // while loop (were re-collected fresh every iteration) so a big bbox
@@ -2211,7 +2316,12 @@ static esp_err_t stream_data_handler(httpd_req_t* req) {
     BboxEntry                                     bbox_entries[BBOX_RING_SLOTS];
     size_t                                        bbox_count = 0;
     size_t                                        bbox_pos   = 0;
-    static char                                   s_bbox_buf[RST_BUFFER_SIZE];
+    // 2026-07-20: the very first chunk of the whole connection still goes
+    // through httpd_resp_send_chunk() (see the combined-send block below) -
+    // that's the call that makes esp_http_server send the status
+    // line/headers, which the raw writev() path used for every later chunk
+    // never does.
+    bool first_chunk_sent = false;
 
     // 2026-07-19: ROOT CAUSE of the "heap freezes at a fixed value and
     // never recovers, even though drops are firing" signature - hardware-
@@ -2264,6 +2374,17 @@ static esp_err_t stream_data_handler(httpd_req_t* req) {
     // blasting a whole burst through unchecked.
 #define BBOX_BURST_CAP (3)
 
+    // 2026-07-20: replaces the old single reused s_bbox_buf[RST_BUFFER_SIZE
+    // =4096] - the combined send below needs up to BBOX_BURST_CAP JSON
+    // batches to coexist (as separate zero-copy iovecs) at once instead of
+    // one at a time, so each slot's own cap is trimmed to
+    // buildInvokeJson()'s real ceiling (BBOX_RING_SLOTS(20) x
+    // (BBOX_ELEM_CAP+2) + JSON wrapper, comfortably under 1024) rather than
+    // reusing RST_BUFFER_SIZE's generous headroom. Net static cost actually
+    // DROPS vs the buffer it replaces: BBOX_BURST_CAP*1024 = 3072 < 4096.
+#define BBOX_BATCH_CAP (1024)
+    static char s_bbox_batch_buf[BBOX_BURST_CAP][BBOX_BATCH_CAP];
+
     while (res == ESP_OK) {
         if (audio_idx >= audio_pending.size() && bbox_pos >= bbox_count) {
             audio_pending.clear();
@@ -2286,7 +2407,28 @@ static esp_err_t stream_data_handler(httpd_req_t* req) {
                     disconnect_reason = "client_gone_idle";
                     break;
                 }
-                if ((xTaskGetTickCount() - idle_since) >= IDLE_TIMEOUT_TICKS) {
+                // 2026-07-19: idle_since used to only reset when there was
+                // actual audio/bbox DATA to send - but cvapp.cpp's
+                // cam_handle_frame() now always sends a lightweight INVOKE
+                // heartbeat even with an empty "boxes": [] (see its own
+                // 2026-07-19 comment), specifically so a healthy-but-quiet
+                // WE2 (sparse scene, no detections for a while) isn't
+                // indistinguishable from a genuinely dead one. Hardware-
+                // confirmed this session: a sparse scene alone produced 16+s
+                // with zero NEW detections, well past the old 10s threshold,
+                // and this handler force-disconnected a perfectly healthy
+                // stream as a result. s_last_uart1_rx_ms already tracks the
+                // timestamp of the last COMPLETE recognized UART1 message
+                // regardless of its content (see fetchFramedMessages()) - an
+                // empty-boxes heartbeat updates it exactly like any other
+                // message, even though it produces zero ring entries
+                // (drainBboxSince() has nothing to return). Treating fresh
+                // UART1 traffic as "not idle", not just fresh ring entries,
+                // is what actually lets that heartbeat do its job.
+                if (s_last_uart1_rx_ms != last_seen_uart1_rx_ms) {
+                    last_seen_uart1_rx_ms = s_last_uart1_rx_ms;
+                    idle_since             = xTaskGetTickCount();
+                } else if ((xTaskGetTickCount() - idle_since) >= IDLE_TIMEOUT_TICKS) {
                     log_w("stream_data_handler: idle timeout (10s with nothing new), "
                           "stopping WE2 stream as a backstop...");
                     disconnect_reason = "idle_timeout";
@@ -2315,145 +2457,195 @@ static esp_err_t stream_data_handler(httpd_req_t* req) {
             break;
         }
 
-        // 2026-07-18: interleave one audio slot with one bbox batch,
-        // alternating, capped at BBOX_BURST_CAP bbox sends per pass - see
-        // that macro's own comment. The client already demuxes by content
-        // (audio magic vs JSON `{`), so interleaving/pacing order doesn't
-        // need a new envelope - same wire format, just paced differently.
-        bool   send_failed         = false;
-        size_t bbox_sent_this_pass = 0;
-        while ((audio_idx < audio_pending.size() ||
-                (bbox_pos < bbox_count && bbox_sent_this_pass < BBOX_BURST_CAP)) &&
-               !send_failed) {
-            if (audio_idx < audio_pending.size()) {
-                auto& slot    = audio_pending[audio_idx++];
-                audio_last_id = slot->id;
-                // TEMP DIAGNOSTIC (2026-07-18): bracket the one call in this
-                // whole path we DON'T control (httpd_resp_send_chunk() ->
-                // esp_http_server -> lwIP) with a heap reading immediately
-                // before/after, to see whether the send call itself is
-                // consuming general heap (TCP send-queue/pbuf growth while a
-                // slow client can't drain fast enough) as opposed to
-                // anything app_httpd.cpp itself allocates - the audio
-                // payload pool and Slot metadata pool are both fixed-size
-                // and shouldn't touch the general heap at all. Only logs
-                // when something actually moved, to avoid flooding at the
-                // normal several-sends/sec rate.
-                size_t free_before_send = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-                errno                   = 0;
-                res                     = httpd_resp_send_chunk(req, (const char*)slot->data, slot->size);
-                int    send_errno       = errno;
-                size_t free_after_send  = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-                if (free_after_send != free_before_send) {
-                    log_w("DBG send_chunk heap delta: before=%u after=%u delta=%d "
-                          "audio_pending.size=%u audio_idx=%u res=%d errno=%d",
-                          (unsigned)free_before_send, (unsigned)free_after_send,
-                          (int)free_after_send - (int)free_before_send,
-                          (unsigned)audio_pending.size(), (unsigned)audio_idx, (int)res, send_errno);
+        // 2026-07-20: collect this pass's whole audio_pending remainder plus
+        // up to BBOX_BURST_CAP bbox batches, then send them as ONE combined
+        // HTTP chunk via a single writev() syscall instead of one
+        // httpd_resp_send_chunk() call per item - see writev_retrying()'s
+        // own comment for the retry/failure semantics, and this function's
+        // header comment for why hand-rolling chunk framing here is judged
+        // safe despite esp_http_server shipping as a prebuilt .a on this
+        // board (no source available locally to verify byte-for-byte).
+        bool   send_failed = false;
+        int    fd          = httpd_req_to_sockfd(req);
+
+        // 2026-07-12 (unchanged rationale): rebuilds the entries copied out
+        // of the ring (under s_bbox_mutex, inside drainBboxSince()) into one
+        // INVOKE JSON line PER BATCH. Each batch now gets its OWN slot (see
+        // BBOX_BATCH_CAP's own comment) instead of reusing one buffer, so
+        // all of them can coexist as separate zero-copy iovecs below.
+        size_t bbox_batch_len[BBOX_BURST_CAP];
+        size_t bbox_batch_n = 0;
+        while (bbox_pos < bbox_count && bbox_batch_n < BBOX_BURST_CAP) {
+            size_t out_len  = 0;
+            size_t consumed = buildInvokeJson(&bbox_entries[bbox_pos], bbox_count - bbox_pos,
+                                               bbox_entries[bbox_pos].id,
+                                               s_bbox_batch_buf[bbox_batch_n], BBOX_BATCH_CAP, &out_len);
+            if (consumed == 0) {
+                break;  // shouldn't happen (bbox_count - bbox_pos > 0 here), safety backstop
+            }
+            bbox_pos += consumed;
+            if (out_len == 0) {
+                continue;  // nothing to send for this batch, but still consumed
+            }
+            size_t termi_len = strlen(MSG_TERMI_STR);
+            if (out_len + termi_len <= BBOX_BATCH_CAP) {
+                memcpy(s_bbox_batch_buf[bbox_batch_n] + out_len, MSG_TERMI_STR, termi_len);
+                bbox_batch_len[bbox_batch_n] = out_len + termi_len;
+            } else {
+                bbox_batch_len[bbox_batch_n] = out_len;  // shouldn't happen, see BBOX_BATCH_CAP
+            }
+            bbox_batch_n++;
+        }
+
+        if (audio_idx < audio_pending.size()) {
+            // 2026-07-17 (unchanged rationale): advance audio_last_id before
+            // any send attempt so a dropped/failed pass is never re-added
+            // from PB.slots next time around.
+            audio_last_id = audio_pending.back()->id;
+        }
+
+        size_t bbox_start = 0;  // batches at [0, bbox_start) already sent via the first-chunk peel below
+
+        // 2026-07-20: the very first chunk of the whole connection must
+        // still go through httpd_resp_send_chunk() - see first_chunk_sent's
+        // own comment. Peel off exactly one item (audio preferred, matching
+        // this handler's existing audio-first-then-bbox ordering) and send
+        // it the old way; everything else in this pass, and every later
+        // pass, goes through the combined writev() path below.
+        if (!first_chunk_sent && (audio_idx < audio_pending.size() || bbox_batch_n > 0)) {
+            bool        first_is_audio = (audio_idx < audio_pending.size());
+            const char* first_buf      = first_is_audio ? (const char*)audio_pending[audio_idx]->data
+                                                          : s_bbox_batch_buf[0];
+            size_t      first_len      = first_is_audio ? audio_pending[audio_idx]->size : bbox_batch_len[0];
+            errno                      = 0;
+            res                        = httpd_resp_send_chunk(req, first_buf, first_len);
+            int first_errno            = errno;
+            if (res == ESP_OK) {
+                first_chunk_sent      = true;
+                drop_streak_start_ms  = 0;
+                if (first_is_audio) {
+                    audio_pending[audio_idx].reset();
+                    audio_idx++;
+                } else {
+                    bbox_start = 1;
                 }
-                if (res != ESP_OK) {
-                    // 2026-07-18: root-caused on hardware - with no send
-                    // timeout, a slow/lagging client left this task blocked
-                    // for ~6s doing nothing (see SO_SNDTIMEO's own comment
-                    // above). Explicit direction: WE2's send rate is
-                    // authoritative - a client that can't keep up should
-                    // lose ITS OWN data, not stall the whole pipe or get
-                    // torn down over one slow chunk. EAGAIN/EWOULDBLOCK
-                    // (send buffer full, non-blocking) and ETIMEDOUT
-                    // (SO_SNDTIMEO fired) both mean "client's still there
-                    // but too slow right now" - drop this one frame and keep
-                    // going. Anything else (ECONNRESET, EPIPE, ENOTCONN,
-                    // ...) means the socket itself is actually gone - that's
-                    // still a real disconnect, handled exactly as before.
-                    if (send_errno == EAGAIN || send_errno == EWOULDBLOCK || send_errno == ETIMEDOUT) {
+            } else if (first_errno == EAGAIN || first_errno == EWOULDBLOCK || first_errno == ETIMEDOUT) {
+                uint32_t now_ms = millis();
+                if (drop_streak_start_ms == 0) {
+                    drop_streak_start_ms = now_ms;
+                }
+                if (now_ms - drop_streak_start_ms >= DROP_STREAK_LIMIT_MS) {
+                    log_e("stream_data_handler: drop streak exceeded %ums (first chunk) - "
+                          "client presumed dead, forcing disconnect to reclaim TCP "
+                          "send buffer - see DROP_STREAK_LIMIT_MS's own comment",
+                          (unsigned)DROP_STREAK_LIMIT_MS);
+                    send_failed = true;
+                } else {
+                    log_w("stream_data_handler: first-chunk send timed out (client too slow) - "
+                          "dropping, errno=%d", first_errno);
+                    if (first_is_audio) {
+                        audio_pending[audio_idx].reset();
+                        audio_idx++;
+                    } else {
+                        bbox_start = 1;
+                    }
+                }
+                res = ESP_OK;
+            } else {
+                log_e("stream_data_handler: first-chunk send hard-failed (socket gone) - "
+                      "errno=%d, res=%d", first_errno, (int)res);
+                send_failed = true;
+            }
+        }
+
+        if (!send_failed) {
+            size_t audio_start = audio_idx;
+            size_t total_len   = 0;
+            for (size_t i = audio_start; i < audio_pending.size(); i++) {
+                total_len += audio_pending[i]->size;
+            }
+            for (size_t i = bbox_start; i < bbox_batch_n; i++) {
+                total_len += bbox_batch_len[i];
+            }
+
+            if (total_len > 0) {
+                char chunk_hdr[16];
+                int  chunk_hdr_len = snprintf(chunk_hdr, sizeof(chunk_hdr), "%x\r\n", (unsigned)total_len);
+
+                struct iovec iov[1 + AUDIO_POOL_SLOTS + BBOX_BURST_CAP + 1];
+                int          iovcnt          = 0;
+                iov[iovcnt].iov_base         = chunk_hdr;
+                iov[iovcnt].iov_len          = (size_t)chunk_hdr_len;
+                iovcnt++;
+                for (size_t i = audio_start; i < audio_pending.size(); i++) {
+                    iov[iovcnt].iov_base = (void*)audio_pending[i]->data;
+                    iov[iovcnt].iov_len  = audio_pending[i]->size;
+                    iovcnt++;
+                }
+                for (size_t i = bbox_start; i < bbox_batch_n; i++) {
+                    iov[iovcnt].iov_base = s_bbox_batch_buf[i];
+                    iov[iovcnt].iov_len  = bbox_batch_len[i];
+                    iovcnt++;
+                }
+                iov[iovcnt].iov_base = (void*)"\r\n";
+                iov[iovcnt].iov_len  = 2;
+                iovcnt++;
+
+                bool already_exhausted = (drop_streak_start_ms != 0) &&
+                                          (millis() - drop_streak_start_ms >= DROP_STREAK_LIMIT_MS);
+                if (already_exhausted || fd < 0) {
+                    log_e("stream_data_handler: drop streak exceeded %ums (combined send) - "
+                          "client presumed dead, forcing disconnect to reclaim TCP "
+                          "send buffer - see DROP_STREAK_LIMIT_MS's own comment",
+                          (unsigned)DROP_STREAK_LIMIT_MS);
+                    send_failed = true;
+                } else {
+                    int      wv_errno       = 0;
+                    uint32_t send_start_ms  = millis();
+                    bool     ok             = writev_retrying(fd, iov, iovcnt, millis() + DROP_STREAK_LIMIT_MS, &wv_errno);
+                    uint32_t send_dur_ms    = millis() - send_start_ms;
+                    // 2026-07-20: mirrors media_client.py's own ">30ms"
+                    // TIMING log (client-side resp.read() etc.) so the two
+                    // sides' logs can be lined up by timestamp - answers
+                    // whether a slow client-observed resp.read() actually
+                    // corresponds to THIS handler being slow to hand the
+                    // bytes off, or whether the delay is happening further
+                    // downstream (WiFi radio/link) after this call already
+                    // returned quickly.
+                    if (send_dur_ms > 30) {
+                        log_w("DBG combined send TIMING: took %ums (audio=%u bbox=%u "
+                              "total_bytes=%u ok=%d errno=%d)",
+                              (unsigned)send_dur_ms, (unsigned)(audio_pending.size() - audio_start),
+                              (unsigned)(bbox_batch_n - bbox_start), (unsigned)total_len, (int)ok, wv_errno);
+                    }
+                    if (ok) {
+                        for (size_t i = audio_start; i < audio_pending.size(); i++) {
+                            audio_pending[i].reset();
+                        }
+                        audio_idx             = audio_pending.size();
+                        bbox_batch_n          = 0;
+                        drop_streak_start_ms  = 0;
+                    } else if (wv_errno == EAGAIN || wv_errno == EWOULDBLOCK || wv_errno == ETIMEDOUT) {
                         uint32_t now_ms = millis();
                         if (drop_streak_start_ms == 0) {
                             drop_streak_start_ms = now_ms;
                         }
-                        if (now_ms - drop_streak_start_ms >= DROP_STREAK_LIMIT_MS) {
-                            log_e("stream_data_handler: drop streak exceeded %ums (audio) - "
-                                  "client presumed dead, forcing disconnect to reclaim TCP "
-                                  "send buffer - see DROP_STREAK_LIMIT_MS's own comment",
-                                  (unsigned)DROP_STREAK_LIMIT_MS);
-                            slot.reset();
-                            send_failed = true;
-                            break;
+                        log_w("stream_data_handler: combined send timed out (client too slow) - "
+                              "dropping pass (audio=%u bbox=%u total_bytes=%u), errno=%d",
+                              (unsigned)(audio_pending.size() - audio_start),
+                              (unsigned)(bbox_batch_n - bbox_start), (unsigned)total_len, wv_errno);
+                        for (size_t i = audio_start; i < audio_pending.size(); i++) {
+                            audio_pending[i].reset();
                         }
-                        log_w("stream_data_handler: audio send timed out (client too slow) - "
-                              "dropping frame id=%u, errno=%d", (unsigned)slot->id, send_errno);
-                        slot.reset();
-                        // bbox's send below uses `res |=` across its own two
-                        // calls - it must start from ESP_OK, not this dropped
-                        // audio attempt's leftover failure code, or a
-                        // perfectly fine bbox send would look like it failed
-                        // too and needlessly kill the connection.
-                        res = ESP_OK;
-                        continue;
-                    }
-                    send_failed = true;
-                    break;
-                }
-                // 2026-07-17: release this slot's shared_ptr the moment
-                // ITS OWN send completes - see AUDIO_POOL_SLOTS' own
-                // comment on why (pool exhaustion from a lagging
-                // first-of-batch release).
-                slot.reset();
-                drop_streak_start_ms = 0;  // a real send got through - streak's over
-            }
-            if (bbox_pos < bbox_count && bbox_sent_this_pass < BBOX_BURST_CAP) {
-                // 2026-07-12: rebuilds the entries copied out of the ring
-                // (under s_bbox_mutex, inside drainBboxSince()) into one
-                // INVOKE JSON line PER BATCH (boxes that arrived together
-                // in the same WE2 message) - see buildInvokeJson()'s own
-                // comment. Static buffer: this handler's httpd instance
-                // still only has one worker task, so exactly one
-                // invocation of this function ever runs at a time - same
-                // single-writer assumption results_handler()'s rst_buf
-                // already relies on.
-                size_t out_len  = 0;
-                size_t consumed = buildInvokeJson(&bbox_entries[bbox_pos], bbox_count - bbox_pos,
-                                                   bbox_entries[bbox_pos].id, s_bbox_buf, sizeof(s_bbox_buf),
-                                                   &out_len);
-                if (consumed == 0) {
-                    break;  // shouldn't happen (bbox_count - bbox_pos > 0 here), safety backstop
-                }
-                bbox_pos += consumed;
-                bbox_sent_this_pass++;
-                if (out_len > 0) {
-                    errno = 0;
-                    res |= httpd_resp_send_chunk(req, s_bbox_buf, out_len);
-                    res |= httpd_resp_send_chunk(req, MSG_TERMI_STR, strlen(MSG_TERMI_STR));
-                    int bbox_errno = errno;
-                    if (res != ESP_OK) {
-                        // 2026-07-18: same drop-not-disconnect treatment as
-                        // the audio branch above - see SO_SNDTIMEO's comment.
-                        // bbox_pos already advanced past this batch, so
-                        // "dropping" here just means not retrying it - matches
-                        // WE2's own AT+SAMPLE/INVOKE semantics (each report is
-                        // a point-in-time event, not something meant to be
-                        // replayed late).
-                        if (bbox_errno == EAGAIN || bbox_errno == EWOULDBLOCK || bbox_errno == ETIMEDOUT) {
-                            uint32_t now_ms = millis();
-                            if (drop_streak_start_ms == 0) {
-                                drop_streak_start_ms = now_ms;
-                            }
-                            if (now_ms - drop_streak_start_ms >= DROP_STREAK_LIMIT_MS) {
-                                log_e("stream_data_handler: drop streak exceeded %ums (bbox) - "
-                                      "client presumed dead, forcing disconnect to reclaim TCP "
-                                      "send buffer - see DROP_STREAK_LIMIT_MS's own comment",
-                                      (unsigned)DROP_STREAK_LIMIT_MS);
-                                send_failed = true;
-                                break;
-                            }
-                            log_w("stream_data_handler: bbox send timed out (client too slow) - "
-                                  "dropping batch, errno=%d", bbox_errno);
-                            res = ESP_OK;
-                            continue;
-                        }
+                        audio_idx    = audio_pending.size();
+                        bbox_batch_n = 0;
+                    } else {
+                        log_e("stream_data_handler: combined send hard-failed (socket gone) - "
+                              "audio=%u bbox=%u total_bytes=%u errno=%d",
+                              (unsigned)(audio_pending.size() - audio_start),
+                              (unsigned)(bbox_batch_n - bbox_start), (unsigned)total_len, wv_errno);
                         send_failed = true;
-                        break;
                     }
-                    drop_streak_start_ms = 0;  // a real send got through - streak's over
                 }
             }
         }
@@ -2978,10 +3170,28 @@ static esp_err_t heap_handler(httpd_req_t* req) {
     if (!checkAuth(req)) {
         return ESP_FAIL;
     }
-    char buf[96];
-    int  len = snprintf(buf, sizeof(buf), "{\"free\": %u, \"largest\": %u}",
+    char buf[160];
+    // 2026-07-20: added rssi/phy mode - see this session's investigation
+    // into resp.read() itself blocking ~1s on the client with a clean (zero
+    // retry/discard) WiFi link on the CLIENT side (checked via `iw`/
+    // /proc/net/wireless), which shifted suspicion to the ESP32's OWN radio
+    // link quality as the still-unchecked side of that path. Arduino's WiFi
+    // library has no direct "negotiated bitrate" accessor (unlike Linux's
+    // `iw` on the client side) - esp_wifi_sta_get_ap_info() is the closest
+    // available: it exposes which PHY mode(s) the connection is actually
+    // using (11b/11g/11n), not a Mbps number, but a connection stuck on
+    // 11b-only (proto_11b, legacy ~1-11Mbps) vs. genuinely using 11n would
+    // be a meaningful, visible difference here.
+    wifi_ap_record_t ap_info = {};
+    esp_wifi_sta_get_ap_info(&ap_info);
+    int rssi = WiFi.RSSI();
+    int  len = snprintf(buf, sizeof(buf),
+                         "{\"free\": %u, \"largest\": %u, \"rssi\": %d, "
+                         "\"phy_11b\": %d, \"phy_11g\": %d, \"phy_11n\": %d, \"channel\": %d}",
                          (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                         rssi, (int)ap_info.phy_11b, (int)ap_info.phy_11g,
+                         (int)ap_info.phy_11n, (int)ap_info.primary);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, buf, len);
@@ -3080,6 +3290,42 @@ static esp_err_t motor_right_handler(httpd_req_t* req) {
     char buf[64];
     int  len = snprintf(buf, sizeof(buf), "{\"angle\": %d, \"connected\": %s}", angle,
                          s_servo_available ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, buf, len);
+}
+
+/* 2026-07-20: sets a target angle and returns immediately - servoRampPoll()
+ * (called from loop()) moves the servo toward it one SERVO_RAMP_STEP_DEG
+ * step at a time, same pacing as the boot-time ramp. Exists so a caller that
+ * wants to sweep a wide range (e.g. a stability test) can do it with ONE
+ * request instead of dozens of /motor/left or /motor/right calls - see
+ * s_servo_target_angle's own comment for why that matters (each old-style
+ * call takes s_cmd_mutex, which is shared with WE2 AT-command traffic;
+ * hammering it every few hundred ms measurably worsened stream stability
+ * this session). Just stores an atomic int - no lock needed here, unlike
+ * stepServoAngle()'s read-modify-write of the CURRENT angle. */
+static esp_err_t motor_set_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
+    char angle_str[16];
+    query_param(req, "angle", angle_str, sizeof(angle_str), "");
+    if (angle_str[0] == '\0') {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+    int target = atoi(angle_str);
+    if (target < SERVO_MIN_ANGLE) {
+        target = SERVO_MIN_ANGLE;
+    } else if (target > SERVO_MAX_ANGLE) {
+        target = SERVO_MAX_ANGLE;
+    }
+    s_servo_target_angle.store(target);
+
+    char buf[96];
+    int  len = snprintf(buf, sizeof(buf), "{\"target\": %d, \"angle\": %d, \"connected\": %s}",
+                         target, s_servo_angle.load(), s_servo_available ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     return httpd_resp_send(req, buf, len);
@@ -3216,6 +3462,18 @@ void startCameraServer() {
 #endif
     };
 
+    httpd_uri_t motor_set_uri = {.uri      = "/motor/set",
+                                 .method   = HTTP_GET,
+                                 .handler  = motor_set_handler,
+                                 .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+                                 ,
+                                 .is_websocket             = true,
+                                 .handle_ws_control_frames = false,
+                                 .supported_subprotocol    = NULL
+#endif
+    };
+
     httpd_uri_t stream_data_uri = {.uri      = "/stream/data",
                                    .method   = HTTP_GET,
                                    .handler  = stream_data_handler,
@@ -3243,6 +3501,7 @@ void startCameraServer() {
         ret |= httpd_register_uri_handler(web_httpd, &audio_stop_uri);
         ret |= httpd_register_uri_handler(web_httpd, &motor_left_uri);
         ret |= httpd_register_uri_handler(web_httpd, &motor_right_uri);
+        ret |= httpd_register_uri_handler(web_httpd, &motor_set_uri);
     }
 
     if (ret != ESP_OK) {

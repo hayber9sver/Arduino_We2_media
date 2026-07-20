@@ -28,8 +28,10 @@ import argparse
 import base64
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -58,19 +60,22 @@ def motor_step(base, direction, user, password, timeout=3):
         return {"ok": False, "error": str(e), "latency_ms": int((time.time() - t0) * 1000)}
 
 
-def run_control_loop(host, user, password, low, high, burst_count, burst_window, rest, duration, log_path):
+def run_control_loop(host, user, password, low, high, burst_count, burst_window, rest, duration, log_path,
+                      stop_event):
     base = f"http://{host}"
     direction = "right"  # sweep up toward `high` first
     angle = None
     start = time.time()
     round_num = 0
     with open(log_path, "w") as logf:
-        while time.time() - start < duration:
+        while time.time() - start < duration and not stop_event.is_set():
             round_num += 1
             round_start = time.time()
             ok_count = 0
             per_cmd_gap = burst_window / burst_count
             for i in range(burst_count):
+                if stop_event.is_set():
+                    break
                 cmd_t0 = time.time()
                 r = motor_step(base, direction, user, password)
                 logf.write(json.dumps({"round": round_num, "cmd_idx": i, "direction": direction,
@@ -93,7 +98,7 @@ def run_control_loop(host, user, password, low, high, burst_count, burst_window,
                             direction = "right"
                 sleep_left = per_cmd_gap - (time.time() - cmd_t0)
                 if sleep_left > 0:
-                    time.sleep(sleep_left)
+                    stop_event.wait(sleep_left)  # interruptible - see stop_event's own comment
             round_elapsed = time.time() - round_start
             over_budget = " OVER-BUDGET" if round_elapsed > burst_window + 0.5 else ""
             log(f"round {round_num}: dir={direction} ok={ok_count}/{burst_count} "
@@ -101,11 +106,11 @@ def run_control_loop(host, user, password, low, high, burst_count, burst_window,
             remaining = duration - (time.time() - start)
             if remaining <= 0:
                 break
-            time.sleep(min(rest, remaining))
-    log(f"control loop done, {round_num} rounds")
+            stop_event.wait(min(rest, remaining))
+    log(f"control loop done, {round_num} rounds{' (interrupted)' if stop_event.is_set() else ''}")
 
 
-def wait_for_capture_ready(outdir, timeout=120):
+def wait_for_capture_ready(outdir, stop_event, timeout=120):
     """Blocks until media_client.py's background capture has actually
     started producing audio data - NOT just that its 'start' subcommand
     returned (that only confirms the background process forked, not that
@@ -120,19 +125,21 @@ def wait_for_capture_ready(outdir, timeout=120):
     attempts in one run). Letting camera+audio establish uncontended first,
     then layering servo traffic on top of an already-healthy stream, is far
     more reliable. Returns True once audio.wav exists with real data,
-    False if the capture process died first or the timeout elapsed."""
+    False if the capture process died first, stop_event fired, or the
+    timeout elapsed."""
     pf = os.path.join(outdir, "media_client.pid")
     wav_path = os.path.join(outdir, "audio.wav")
     deadline = time.time() + timeout
-    while time.time() < deadline:
+    while time.time() < deadline and not stop_event.is_set():
         if not os.path.exists(pf):
             log("capture process exited before producing any audio - see media_client.log")
             return False
         if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
             log("capture confirmed producing audio data - starting servo control loop")
             return True
-        time.sleep(2)
-    log(f"capture did not produce audio within {timeout}s - proceeding anyway")
+        stop_event.wait(2)
+    if not stop_event.is_set():
+        log(f"capture did not produce audio within {timeout}s - proceeding anyway")
     return False
 
 
@@ -157,6 +164,26 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     control_log = os.path.join(outdir, "control_log.jsonl")
 
+    # 2026-07-19: without a signal handler, SIGTERM (e.g. from a wrapper
+    # script that wants to abort early - see this project's watchdog_test.sh)
+    # kills the interpreter immediately, skipping the `finally` block below
+    # entirely - so the capture never gets its own explicit, graceful
+    # media_client.py stop from THIS process (the background capture daemon
+    # survives regardless, being independently forked/detached, but relies
+    # on being stopped by some other means instead - not a data-loss bug,
+    # just means this script's own cleanup never ran). stop_event mirrors
+    # media_client.py's own handle_sigterm()/stop_event pattern so SIGTERM
+    # here instead breaks the control loop promptly and lets `finally` run
+    # normally.
+    stop_event = threading.Event()
+
+    def handle_sigterm(signum, frame):
+        log("received stop signal, finishing up...")
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    signal.signal(signal.SIGINT, handle_sigterm)
+
     log(f"starting camera+audio capture (resolution={args.resolution}, rate={args.rate}) -> {outdir}")
     subprocess.run([sys.executable, args.media_client, "start",
                      "--host", args.host, "--outdir", outdir,
@@ -165,7 +192,7 @@ def main():
                      "--user", args.user, "--password", args.password], check=True)
 
     pf = os.path.join(outdir, "media_client.pid")
-    if not wait_for_capture_ready(outdir) and not os.path.exists(pf):
+    if not wait_for_capture_ready(outdir, stop_event) and not os.path.exists(pf):
         log("capture process crashed during startup - aborting rather than running the "
             "control loop against a dead capture (check media_client.log)")
         sys.exit(1)
@@ -176,7 +203,8 @@ def main():
             f"{args.burst_count} cmds/{args.burst_window}s burst, {args.rest}s rest, "
             f"total {args.duration}s")
         run_control_loop(args.host, args.user, args.password, args.low, args.high,
-                          args.burst_count, args.burst_window, args.rest, args.duration, control_log)
+                          args.burst_count, args.burst_window, args.rest, args.duration, control_log,
+                          stop_event)
     finally:
         capture_end_ts = time.time()
         log("stopping capture...")
