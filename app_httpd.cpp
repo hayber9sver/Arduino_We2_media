@@ -677,16 +677,51 @@ private:
  * this really is single-writer again, just enforced instead of assumed. */
 static char s_awaited_tag[32] = {0};
 
-/* 2026-07-18: see s_awaited_tag's comment above - serializes the entire
- * body of sendTaggedCommand() (tag bookkeeping + the raw Wire/I2C
- * transmission + the reply-wait poll) across whichever task calls it, since
- * independent httpd worker tasks (web_httpd; data_httpd via
+/* 2026-07-18: see s_awaited_tag's comment above - serializes tag bookkeeping
+ * + the reply-wait poll of sendTaggedCommand() across whichever task calls
+ * it, since independent httpd worker tasks (web_httpd; data_httpd via
  * disconnectStreamClient()) can both legitimately call it. Plain
  * (non-recursive) mutex - sendBreakBestEffort() takes and releases its OWN
  * separate short critical section for its debounce check before calling
  * sendTaggedCommand(), never while already holding this one, so there's no
- * self-deadlock risk. */
+ * self-deadlock risk.
+ *
+ * 2026-07-21: NO LONGER covers the raw I2C write itself (see
+ * s_i2c_bus_mutex below, which now guards that) - it used to, and that was
+ * the whole problem: this mutex is held for the ENTIRE AT-command round
+ * trip including the reply-wait poll, up to RESULT_TIMEOUT_MS (8000ms) on a
+ * timeout. The servo code (stepServoAngle()/servoRampPoll(), called from
+ * loopTask - the same, highest-priority task that drains WE2's UART, see
+ * loopTask's own priority-bump comment in camera_web_server.ino) used to
+ * share this exact mutex purely to arbitrate the physical I2C bus, which
+ * meant a servo step could block loopTask for up to 8 seconds behind an
+ * in-flight AT command that has nothing to do with I2C at that point (it's
+ * just waiting on a UART reply). Splitting the bus-arbitration concern out
+ * into its own short-held mutex lets a servo step proceed immediately even
+ * while a sendTaggedCommand() call is deep in its reply-wait poll, since
+ * that poll doesn't touch the I2C bus at all - see stepServoAngle()'s and
+ * s_servo_mutex's own comments. */
 static SemaphoreHandle_t s_cmd_mutex;
+
+/* 2026-07-21: guards the physical I2C bus (Wire, D0/D1) itself - the ONE
+ * thing sendTaggedCommand()'s raw write and every PCA9685 servo write
+ * (pca9685WriteReg()/pca9685SetPwm()) genuinely share and must not
+ * interleave on. Held only for the duration of a single Wire
+ * transmission (microseconds-to-low-single-digit-ms), never across a
+ * poll, a delay(), or an NVS write - see s_cmd_mutex's own comment for why
+ * that distinction matters. */
+static SemaphoreHandle_t s_i2c_bus_mutex;
+
+/* 2026-07-21: guards the read-modify-write of s_servo_angle + the PWM write
+ * + the persist-to-NVS decision as one atomic unit, so two concurrent step
+ * requests (e.g. /motor/left and servoRampPoll() both landing at once)
+ * can't race on the read and silently drop a step - see stepServoAngle()'s
+ * own comment. Deliberately separate from s_cmd_mutex: the servo has never
+ * needed to be mutually exclusive with an AT command's multi-second
+ * reply-wait, only with the brief moment another servo write or an
+ * AT-command's I2C write (itself now under s_i2c_bus_mutex, taken
+ * internally by pca9685WriteReg()/pca9685SetPwm()) is on the wire. */
+static SemaphoreHandle_t s_servo_mutex;
 
 /* 2026-07-18: minimal RAII wrapper so sendTaggedCommand()'s several early
  * return points (timeout, success) can't accidentally leak s_cmd_mutex held -
@@ -839,9 +874,11 @@ static bool checkAuth(httpd_req_t* req) {
 }
 
 void initSharedBuffer() {
-    PB.mutex     = xSemaphoreCreateMutex();
-    s_bbox_mutex = xSemaphoreCreateMutex();
-    s_cmd_mutex  = xSemaphoreCreateMutex();
+    PB.mutex        = xSemaphoreCreateMutex();
+    s_bbox_mutex    = xSemaphoreCreateMutex();
+    s_cmd_mutex     = xSemaphoreCreateMutex();
+    s_i2c_bus_mutex = xSemaphoreCreateMutex();
+    s_servo_mutex   = xSemaphoreCreateMutex();
     initHttpAuth();
 }
 
@@ -966,10 +1003,13 @@ static std::atomic<int> s_servo_angle(SERVO_BOOT_ANGLE);
 // - see servoRampPoll()'s own comment for why this exists (one HTTP call
 // sets this, a background poll steps toward it over time) instead of the
 // caller having to spam many /motor/left or /motor/right calls to sweep a
-// wide range, which was measured this session to add real s_cmd_mutex
-// contention against WE2 AT-command traffic under sustained sweeping (every
-// ~0.5-0.65s for the whole test) - see stepServoAngle()'s own comment on why
-// it shares that mutex with sendTaggedCommand()/sendBreakBestEffort().
+// wide range. Originally motivated by real s_cmd_mutex contention measured
+// against WE2 AT-command traffic under sustained sweeping (every ~0.5-0.65s
+// for the whole test) - that root cause (the servo sharing s_cmd_mutex's
+// multi-second AT-command reply-wait hold, not just brief I2C bus access)
+// is now fixed directly (2026-07-21, see s_cmd_mutex's own comment), but
+// this mechanism still stands on its own merits: fewer HTTP round trips to
+// sweep a wide range either way.
 static std::atomic<int> s_servo_target_angle(SERVO_BOOT_ANGLE);
 
 // 2026-07-19: persists the last-commanded angle across power cycles
@@ -993,10 +1033,13 @@ static Preferences s_servo_prefs;
 // I2C op on this bus (WE2 command traffic included) to 200ms.
 static bool s_servo_available = false;
 
-// No lock of its own - callers (below) take s_cmd_mutex first. Returns the
+// 2026-07-21: takes s_i2c_bus_mutex itself now (used to rely on callers
+// holding s_cmd_mutex - see that mutex's own comment for why that no longer
+// works now the servo path doesn't take s_cmd_mutex at all). Returns the
 // Wire.endTransmission() status (0 = success) so callers can detect a
 // missing/non-ACKing PCA9685 instead of assuming the write landed.
 static uint8_t pca9685WriteReg(uint8_t reg, uint8_t val) {
+    MutexGuard bus_lock(s_i2c_bus_mutex);
     Wire.beginTransmission(PCA9685_ADDR);
     Wire.write(reg);
     Wire.write(val);
@@ -1006,16 +1049,27 @@ static uint8_t pca9685WriteReg(uint8_t reg, uint8_t val) {
 // Sets one PWM channel's ON/OFF tick counts (0-4095 across one 4096-tick
 // PWM period). ON is always 0 here (pulse starts at the top of the period),
 // only OFF varies - the datasheet's simplest single-pulse-per-period usage.
-// No lock of its own - callers (below) take s_cmd_mutex first.
-static void pca9685SetPwm(uint8_t channel, uint16_t on, uint16_t off) {
-    uint8_t base = PCA9685_REG_LED0_ON_L + 4 * channel;
+// Takes s_i2c_bus_mutex itself - see pca9685WriteReg()'s own comment.
+//
+// 2026-07-21: now returns the Wire.endTransmission() status (previously
+// discarded) so a NACK/timeout here is at least detectable if a caller ever
+// wants to check it - a live sweep is a repeated string of these calls with
+// the servo physically under load, and this was previously invisible
+// (silently eating up to Wire.setTimeOut(200)'s 200ms inside loopTask with
+// zero log trace). Investigated as a candidate root cause for a client-side
+// stream latency correlation this session; hardware-measured clean (no
+// errors, all calls under threshold) - the actual culprit turned out to be
+// stepServoAngle()'s display redraw instead, see its own comment.
+static uint8_t pca9685SetPwm(uint8_t channel, uint16_t on, uint16_t off) {
+    MutexGuard bus_lock(s_i2c_bus_mutex);
+    uint8_t    base = PCA9685_REG_LED0_ON_L + 4 * channel;
     Wire.beginTransmission(PCA9685_ADDR);
     Wire.write(base);
     Wire.write(on & 0xFF);
     Wire.write(on >> 8);
     Wire.write(off & 0xFF);
     Wire.write(off >> 8);
-    Wire.endTransmission();
+    return Wire.endTransmission();
 }
 
 // Converts a 0-180 degree angle into the PCA9685 tick count (0-4095 across
@@ -1031,7 +1085,7 @@ static uint16_t servoAngleToTicks(int angle) {
 // (either direction), pausing SERVO_RAMP_STEP_DELAY_MS between each - see
 // SERVO_RAMP_STEP_DEG's own comment for why boot centering ramps instead of
 // jumping straight to the target. No lock of its own - callers take
-// s_cmd_mutex first. Both angles are assumed already clamped to
+// s_servo_mutex first. Both angles are assumed already clamped to
 // [SERVO_MIN_ANGLE, SERVO_MAX_ANGLE].
 static void rampServoTo(int from_angle, int to_angle) {
     int step = (to_angle >= from_angle) ? SERVO_RAMP_STEP_DEG : -SERVO_RAMP_STEP_DEG;
@@ -1044,14 +1098,64 @@ static void rampServoTo(int from_angle, int to_angle) {
     pca9685SetPwm(SERVO_PWM_CHANNEL, 0, servoAngleToTicks(to_angle));
 }
 
-// Applies delta (+/-SERVO_STEP_DEG, from motor_left/right_handler) to the
-// tracked angle, clamped to [SERVO_MIN_ANGLE, SERVO_MAX_ANGLE] so the SG92R
-// can never be commanded past its physical 0-180 range. Read-modify-write
-// of s_servo_angle happens under s_cmd_mutex (not just the I2C write) so two
-// concurrent step requests can't race on the read and silently drop a step.
-// Returns the resulting angle.
-static int stepServoAngle(int delta) {
-    MutexGuard cmd_lock(s_cmd_mutex);
+// Applies delta (+/-SERVO_STEP_DEG, from motor_left/right_handler, or a
+// ramp step from servoRampPoll()) to the tracked angle, clamped to
+// [SERVO_MIN_ANGLE, SERVO_MAX_ANGLE] so the SG92R can never be commanded
+// past its physical 0-180 range. Read-modify-write of s_servo_angle happens
+// under s_servo_mutex (not just the I2C write, which pca9685SetPwm() itself
+// further guards with s_i2c_bus_mutex) so two concurrent step requests
+// can't race on the read and silently drop a step.
+//
+// 2026-07-21: `persist` lets the caller defer both the NVS write AND the
+// display redraw instead of doing them on every single call - see
+// servoRampPoll()'s own comment for why a multi-step ramp only wants this
+// true on the step that actually reaches the target, not every intermediate
+// step. motor_left/right_handler (manual, human-paced single steps - each
+// one a deliberate final resting position) always pass true. Returns the
+// resulting angle.
+//
+// 2026-07-21: the display redraw specifically went through THREE attempts
+// this session before landing back here - kept as history, all three traps
+// are easy to fall back into if this is ever "simplified":
+//   1. Direct, unconditional displayShowMotorAngle() call every step (the
+//      original code): hardware-measured ~65-75ms per call (SPI text
+//      redraw on the ST7735), an order of magnitude slower than the
+//      PCA9685 I2C write - a 40-75 step sweep could burn 2.5-5+ seconds of
+//      loopTask time on redraws alone, directly stalling WE2 UART drain
+//      (loopTask's own priority-bump comment in camera_web_server.ino
+//      explains why that task being blocked at all is bad).
+//   2. Rate-limited to at most once per 250ms: measured on hardware to
+//      still cut resp.read() spikes down but NOT eliminate them, and the
+//      achieved gap between redraws came out to ~525ms, not the configured
+//      250ms - under sustained 32kHz-audio+camera load, loopTask is
+//      sensitive enough to ANY added per-iteration cost that a slower
+//      loop() cycle lets UART RX backlog grow, which makes the NEXT
+//      fetchFramedMessages() call take longer to drain, which delays the
+//      loop even further - a self-reinforcing bufferbloat-style cascade
+//      where a bounded, rate-limited cost turned into an unbounded-feeling
+//      one.
+//   3. Moved the SPI work off loopTask entirely onto a dedicated
+//      xTaskCreate()'d consumer task fed by a queue: this DID fix the
+//      loopTask-stall/latency-spike problem (hardware-confirmed), but
+//      xTaskCreate()'s stack (4096B, permanently allocated for the life of
+//      the process, not pooled/reused like everything else in this file)
+//      pushed this board's already-razor-thin heap over the edge under
+//      sustained 32kHz-audio+camera+motor load - hardware-confirmed via a
+//      real crash/reboot (USB re-enumerated) with heap stats logged right
+//      before it (free=6436 largest=1652 min_ever_free=348) showing severe
+//      fragmentation and near-total exhaustion. Reverted. This board's heap
+//      margin has bitten this exact way before (see AUDIO_POOL_SLOTS 3->4
+//      in the bridge memory doc) - ANY new persistent allocation here
+//      (task stack, static buffer, or otherwise) needs the same full
+//      combined-load hardware soak test as that, not just a couple of
+//      short sweeps, before it can be trusted.
+// The persist-gate below (skip the redraw on every non-final ramp step,
+// not just rate-limit it) is the one that's actually shipped: zero
+// additional heap cost, and the tradeoff (display doesn't animate live
+// during a sweep, only jumps to the final value once it settles) is a
+// reasonable price for a fix that doesn't reopen the heap-exhaustion risk.
+static int stepServoAngle(int delta, bool persist) {
+    MutexGuard servo_lock(s_servo_mutex);
     int        angle = s_servo_angle.load() + delta;
     if (angle < SERVO_MIN_ANGLE) {
         angle = SERVO_MIN_ANGLE;
@@ -1066,26 +1170,42 @@ static int stepServoAngle(int delta) {
         pca9685SetPwm(SERVO_PWM_CHANNEL, 0, servoAngleToTicks(angle));
     }
     s_servo_angle.store(angle);
-    s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, angle);
-    // "--" (not a possibly-misleading number) if there's no PCA9685 to
-    // actually be holding this position - matches s_servo_available's own
-    // gating of the real PWM write just above.
-    displayShowMotorAngle(s_servo_available ? angle : -1);
+    if (persist) {
+        s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, angle);
+        // "--" (not a possibly-misleading number) if there's no PCA9685 to
+        // actually be holding this position - matches s_servo_available's
+        // own gating of the real PWM write just above. Only reached here on
+        // the step that actually settles (manual step, or a ramp's final
+        // step) - see this function's own comment for why intermediate ramp
+        // steps skip this entirely instead of merely rate-limiting it or
+        // moving it to another task.
+        displayShowMotorAngle(s_servo_available ? angle : -1);
+    }
     return angle;
 }
 
 // 2026-07-20: non-blocking counterpart to rampServoTo() - that function (used
-// only at boot, see initServoMotor()) holds s_cmd_mutex for its ENTIRE
-// multi-step ramp, which is fine once at startup but would be a much worse
-// version of the exact contention problem this whole mechanism exists to
-// avoid if reused for a live "move slowly to X" request while AT-command
-// traffic is active. Call this from loop() instead: each call does AT MOST
-// one SERVO_RAMP_STEP_DEG step, taking s_cmd_mutex only for that one step's
-// read-modify-write + I2C write (same brief-hold pattern as
-// stepServoAngle(), which this largely mirrors), then returns - s_cmd_mutex
+// only at boot, see initServoMotor()) holds s_servo_mutex for its ENTIRE
+// multi-step ramp, which is fine once at startup (nothing else can be
+// calling in) but would be a much worse version of the exact contention
+// problem this whole mechanism exists to avoid if reused for a live "move
+// slowly to X" request. Call this from loop() instead: each call does AT
+// MOST one SERVO_RAMP_STEP_DEG step, taking s_servo_mutex only for that one
+// step's read-modify-write + I2C write (same brief-hold pattern as
+// stepServoAngle(), which this largely mirrors), then returns - the mutex
 // is never held across the pacing delay itself, so a long sweep now costs
-// one HTTP request instead of dozens and never blocks a pending AT command
-// for longer than a single 2-degree step.
+// one HTTP request instead of dozens.
+//
+// 2026-07-21: this runs in loopTask - the same, highest-priority task that
+// drains WE2's UART (see loopTask's own priority-bump comment in
+// camera_web_server.ino) - so stepServoAngle() blocking here for any
+// meaningful time would stall UART draining right along with it. That's
+// exactly why the servo path was split onto its own s_servo_mutex +
+// s_i2c_bus_mutex instead of continuing to share s_cmd_mutex with
+// sendTaggedCommand(): the old shared mutex meant a ramp step could block
+// this task for up to RESULT_TIMEOUT_MS (8000ms) behind an in-flight AT
+// command's reply-wait poll, even though that poll never touches the I2C
+// bus - see s_cmd_mutex's own comment.
 void servoRampPoll() {
     static uint32_t s_last_step_ms = 0;
     int              target        = s_servo_target_angle.load();
@@ -1103,7 +1223,22 @@ void servoRampPoll() {
     if (abs(target - current) < abs(delta)) {
         delta = target - current;
     }
-    stepServoAngle(delta);
+    // 2026-07-21: only persist to NVS + redraw the display on the step that
+    // actually reaches target, not every intermediate step - computed from
+    // THIS call's own target/current snapshot, not re-read after the fact,
+    // so it stays correct even if motor_set_handler() stores a brand new
+    // target on the HTTP thread in between: the value this step writes is
+    // simply "the angle the servo is physically at right now", which is
+    // accurate regardless of what target changes to next - the ramp just
+    // continues toward the new one on the following tick and persists again
+    // whenever it (or a later one) is finally reached. Avoids doing either
+    // on every single 60ms tick of a sweep (flash wear + latency for NVS;
+    // for the display, see stepServoAngle()'s own comment for the full
+    // history of why this all-or-nothing gate is what's shipped, not a
+    // rate limit or a separate task) for a value that, for every step but
+    // the last, is immediately superseded anyway.
+    bool reaches_target = (current + delta == target);
+    stepServoAngle(delta, reaches_target);
 }
 
 // Initializes the PCA9685 at 50Hz (standard analog-servo update rate) and
@@ -1113,7 +1248,11 @@ void servoRampPoll() {
 // PCA9685 (logs a warning and leaves s_servo_available false) instead of
 // blocking boot - see s_servo_available's own comment for why this matters.
 void initServoMotor() {
-    MutexGuard cmd_lock(s_cmd_mutex);
+    // Nothing else can be calling stepServoAngle()/servoRampPoll() yet at
+    // this point in setup() (httpd isn't started until after this returns),
+    // so this lock is just for consistency with every other PCA9685 access
+    // path, not a real concurrency concern here.
+    MutexGuard servo_lock(s_servo_mutex);
 
     s_servo_prefs.begin(SERVO_NVS_NAMESPACE, /*readOnly=*/false);
     // Ramp start point = wherever the servo was last actually commanded to
@@ -2782,15 +2921,28 @@ static SlotRef sendTaggedCommand(const char* body, size_t body_len, char* cmd_ta
     // so either the 50ms default isn't actually being honored by the
     // underlying i2c_master_transmit() call, or the hang is somewhere else
     // entirely - this will show definitively which.
-    Serial.printf("sendTaggedCommand: before Wire I2C send, tag=%s\r\n", cmd_tag_buf);
-    Wire.setTimeOut(200);
-    Wire.beginTransmission(WE2_I2C_CMD_ADDR);
-    Wire.write((const uint8_t*)CMD_PREFIX, strlen(CMD_PREFIX));
-    Wire.write((const uint8_t*)cmd_tag_buf, cmd_tag_size);
-    Wire.write((const uint8_t*)body, body_len);
-    Wire.write((const uint8_t*)CMD_SUFFIX, strlen(CMD_SUFFIX));
-    uint8_t i2c_err = Wire.endTransmission();
-    Serial.printf("sendTaggedCommand: after Wire I2C send, tag=%s, err=%u\r\n", cmd_tag_buf, (unsigned)i2c_err);
+    //
+    // 2026-07-21: this block now takes s_i2c_bus_mutex of its own accord
+    // (scoped, released the instant the transmission finishes) instead of
+    // relying on s_cmd_mutex (still held for the whole outer function) to
+    // arbitrate the bus - see s_i2c_bus_mutex's own comment. Two concurrent
+    // sendTaggedCommand() callers still can't reach this point at the same
+    // time regardless (s_cmd_mutex already serializes the whole function),
+    // so the only thing this actually adds exclusion against is a servo I2C
+    // write landing mid-transmission.
+    uint8_t i2c_err;
+    {
+        MutexGuard bus_lock(s_i2c_bus_mutex);
+        Serial.printf("sendTaggedCommand: before Wire I2C send, tag=%s\r\n", cmd_tag_buf);
+        Wire.setTimeOut(200);
+        Wire.beginTransmission(WE2_I2C_CMD_ADDR);
+        Wire.write((const uint8_t*)CMD_PREFIX, strlen(CMD_PREFIX));
+        Wire.write((const uint8_t*)cmd_tag_buf, cmd_tag_size);
+        Wire.write((const uint8_t*)body, body_len);
+        Wire.write((const uint8_t*)CMD_SUFFIX, strlen(CMD_SUFFIX));
+        i2c_err = Wire.endTransmission();
+        Serial.printf("sendTaggedCommand: after Wire I2C send, tag=%s, err=%u\r\n", cmd_tag_buf, (unsigned)i2c_err);
+    }
     if (i2c_err != 0) {
         Serial.printf("sendTaggedCommand: I2C write failed, err=%u\r\n", (unsigned)i2c_err);
     }
@@ -3273,7 +3425,7 @@ static esp_err_t motor_left_handler(httpd_req_t* req) {
     if (!checkAuth(req)) {
         return ESP_FAIL;
     }
-    int  angle = stepServoAngle(-SERVO_STEP_DEG);
+    int  angle = stepServoAngle(-SERVO_STEP_DEG, /*persist=*/true);
     char buf[64];
     int  len = snprintf(buf, sizeof(buf), "{\"angle\": %d, \"connected\": %s}", angle,
                          s_servo_available ? "true" : "false");
@@ -3286,7 +3438,7 @@ static esp_err_t motor_right_handler(httpd_req_t* req) {
     if (!checkAuth(req)) {
         return ESP_FAIL;
     }
-    int  angle = stepServoAngle(SERVO_STEP_DEG);
+    int  angle = stepServoAngle(SERVO_STEP_DEG, /*persist=*/true);
     char buf[64];
     int  len = snprintf(buf, sizeof(buf), "{\"angle\": %d, \"connected\": %s}", angle,
                          s_servo_available ? "true" : "false");
@@ -3300,11 +3452,9 @@ static esp_err_t motor_right_handler(httpd_req_t* req) {
  * step at a time, same pacing as the boot-time ramp. Exists so a caller that
  * wants to sweep a wide range (e.g. a stability test) can do it with ONE
  * request instead of dozens of /motor/left or /motor/right calls - see
- * s_servo_target_angle's own comment for why that matters (each old-style
- * call takes s_cmd_mutex, which is shared with WE2 AT-command traffic;
- * hammering it every few hundred ms measurably worsened stream stability
- * this session). Just stores an atomic int - no lock needed here, unlike
- * stepServoAngle()'s read-modify-write of the CURRENT angle. */
+ * s_servo_target_angle's own comment for the history there. Just stores an
+ * atomic int - no lock needed here, unlike stepServoAngle()'s read-modify-
+ * write of the CURRENT angle. */
 static esp_err_t motor_set_handler(httpd_req_t* req) {
     if (!checkAuth(req)) {
         return ESP_FAIL;
