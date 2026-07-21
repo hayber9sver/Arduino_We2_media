@@ -35,7 +35,9 @@ ST7735_XIAO::ST7735_XIAO(int8_t cs, int8_t dc, int8_t rst, int16_t w, int16_t h)
 void ST7735_XIAO::begin(uint32_t spiHz, int8_t sck, int8_t mosi, int8_t miso) {
     _spiSettings = SPISettings(spiHz, MSBFIRST, SPI_MODE0);
 
-    pinMode(_cs, OUTPUT);
+    if (_cs >= 0) {
+        pinMode(_cs, OUTPUT);
+    }
     pinMode(_dc, OUTPUT);
     pinMode(_rst, OUTPUT);
     csHigh();

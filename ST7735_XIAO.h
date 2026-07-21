@@ -17,6 +17,11 @@
 // this class's drawPixel()/fillRect() implementations.
 class ST7735_XIAO : public Adafruit_GFX {
 public:
+    // 2026-07-21: cs=-1 means "no CS pin under software control" - tie the
+    // panel's CS line permanently to GND in hardware instead. Only valid
+    // when this is the ONLY device on the SPI bus (true here - nothing else
+    // shares SCK/MOSI/MISO), since a permanently-selected device would
+    // otherwise collide with any other device trying to use the bus.
     ST7735_XIAO(int8_t cs, int8_t dc, int8_t rst, int16_t w = 128, int16_t h = 128);
 
     // spiHz: SPI clock. sck/mosi/miso: pass -1 (default) to use the board's
@@ -49,8 +54,8 @@ private:
     void writeData(uint8_t data);
     void setAddrWindow(int16_t x0, int16_t y0, int16_t x1, int16_t y1);
 
-    inline void csLow()  { digitalWrite(_cs, LOW); }
-    inline void csHigh() { digitalWrite(_cs, HIGH); }
+    inline void csLow()  { if (_cs >= 0) digitalWrite(_cs, LOW); }
+    inline void csHigh() { if (_cs >= 0) digitalWrite(_cs, HIGH); }
     inline void dcLow()  { digitalWrite(_dc, LOW); }
     inline void dcHigh() { digitalWrite(_dc, HIGH); }
 };

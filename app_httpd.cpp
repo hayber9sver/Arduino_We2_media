@@ -678,49 +678,35 @@ private:
 static char s_awaited_tag[32] = {0};
 
 /* 2026-07-18: see s_awaited_tag's comment above - serializes tag bookkeeping
- * + the reply-wait poll of sendTaggedCommand() across whichever task calls
- * it, since independent httpd worker tasks (web_httpd; data_httpd via
- * disconnectStreamClient()) can both legitimately call it. Plain
- * (non-recursive) mutex - sendBreakBestEffort() takes and releases its OWN
- * separate short critical section for its debounce check before calling
- * sendTaggedCommand(), never while already holding this one, so there's no
- * self-deadlock risk.
+ * + the raw I2C write + the reply-wait poll of sendTaggedCommand() across
+ * whichever task calls it, since independent httpd worker tasks (web_httpd;
+ * data_httpd via disconnectStreamClient()) can both legitimately call it.
+ * Plain (non-recursive) mutex - sendBreakBestEffort() takes and releases
+ * its OWN separate short critical section for its debounce check before
+ * calling sendTaggedCommand(), never while already holding this one, so
+ * there's no self-deadlock risk.
  *
- * 2026-07-21: NO LONGER covers the raw I2C write itself (see
- * s_i2c_bus_mutex below, which now guards that) - it used to, and that was
- * the whole problem: this mutex is held for the ENTIRE AT-command round
- * trip including the reply-wait poll, up to RESULT_TIMEOUT_MS (8000ms) on a
- * timeout. The servo code (stepServoAngle()/servoRampPoll(), called from
- * loopTask - the same, highest-priority task that drains WE2's UART, see
- * loopTask's own priority-bump comment in camera_web_server.ino) used to
- * share this exact mutex purely to arbitrate the physical I2C bus, which
- * meant a servo step could block loopTask for up to 8 seconds behind an
- * in-flight AT command that has nothing to do with I2C at that point (it's
- * just waiting on a UART reply). Splitting the bus-arbitration concern out
- * into its own short-held mutex lets a servo step proceed immediately even
- * while a sendTaggedCommand() call is deep in its reply-wait poll, since
- * that poll doesn't touch the I2C bus at all - see stepServoAngle()'s and
- * s_servo_mutex's own comments. */
+ * 2026-07-21: used to also be shared with the servo (PCA9685 over I2C),
+ * which caused a real bug - a servo step could block loopTask (the
+ * highest-priority task, which also drains WE2's UART) for up to
+ * RESULT_TIMEOUT_MS (8000ms) behind this mutex's multi-second AT-command
+ * reply-wait, even though that poll never touched the I2C bus at all. Fixed
+ * for good by moving the servo off I2C entirely (direct GPIO PWM via the
+ * ESP32-C3's own LEDC peripheral on D4 - see SERVO_PWM_PIN) instead of
+ * PCA9685, so there's no longer any bus this mutex and the servo could
+ * possibly contend over - see s_servo_mutex's own comment for what that
+ * pin change is about. */
 static SemaphoreHandle_t s_cmd_mutex;
-
-/* 2026-07-21: guards the physical I2C bus (Wire, D0/D1) itself - the ONE
- * thing sendTaggedCommand()'s raw write and every PCA9685 servo write
- * (pca9685WriteReg()/pca9685SetPwm()) genuinely share and must not
- * interleave on. Held only for the duration of a single Wire
- * transmission (microseconds-to-low-single-digit-ms), never across a
- * poll, a delay(), or an NVS write - see s_cmd_mutex's own comment for why
- * that distinction matters. */
-static SemaphoreHandle_t s_i2c_bus_mutex;
 
 /* 2026-07-21: guards the read-modify-write of s_servo_angle + the PWM write
  * + the persist-to-NVS decision as one atomic unit, so two concurrent step
  * requests (e.g. /motor/left and servoRampPoll() both landing at once)
  * can't race on the read and silently drop a step - see stepServoAngle()'s
- * own comment. Deliberately separate from s_cmd_mutex: the servo has never
- * needed to be mutually exclusive with an AT command's multi-second
- * reply-wait, only with the brief moment another servo write or an
- * AT-command's I2C write (itself now under s_i2c_bus_mutex, taken
- * internally by pca9685WriteReg()/pca9685SetPwm()) is on the wire. */
+ * own comment. Deliberately separate from s_cmd_mutex: the servo (direct
+ * GPIO PWM via LEDC, see SERVO_PWM_PIN) doesn't touch the I2C bus at all
+ * anymore, so it has never needed to be mutually exclusive with an
+ * AT-command's I2C write or its reply-wait - only with another concurrent
+ * servo write. */
 static SemaphoreHandle_t s_servo_mutex;
 
 /* 2026-07-18: minimal RAII wrapper so sendTaggedCommand()'s several early
@@ -874,11 +860,10 @@ static bool checkAuth(httpd_req_t* req) {
 }
 
 void initSharedBuffer() {
-    PB.mutex        = xSemaphoreCreateMutex();
-    s_bbox_mutex    = xSemaphoreCreateMutex();
-    s_cmd_mutex     = xSemaphoreCreateMutex();
-    s_i2c_bus_mutex = xSemaphoreCreateMutex();
-    s_servo_mutex   = xSemaphoreCreateMutex();
+    PB.mutex      = xSemaphoreCreateMutex();
+    s_bbox_mutex  = xSemaphoreCreateMutex();
+    s_cmd_mutex   = xSemaphoreCreateMutex();
+    s_servo_mutex = xSemaphoreCreateMutex();
     initHttpAuth();
 }
 
@@ -957,26 +942,47 @@ void initI2CCommandChannel() {
 }
 
 // ---------------------------------------------------------------------------
-// 2026-07-19: PCA9685 (I2C addr 0x40, default - all address pins tied low)
-// driving an SG92R servo on PWM channel 0. Shares the same physical I2C
-// bus/pins that initI2CCommandChannel() above already configured
-// (Wire.begin(D0, D1)) - this does NOT call Wire.begin() again, and every
-// raw Wire access below is taken under s_cmd_mutex (same mutex
-// sendTaggedCommand() uses for WE2 traffic on this bus - see s_cmd_mutex's
-// own comment), so a servo write can never interleave its bytes with an
-// in-flight AT command's.
-#define PCA9685_ADDR          (0x40)
-#define PCA9685_REG_MODE1     (0x00)
-#define PCA9685_REG_MODE2     (0x01)
-#define PCA9685_REG_PRESCALE  (0xFE)
-#define PCA9685_REG_LED0_ON_L (0x06)
-#define PCA9685_MODE1_AI      (0x20)  // auto-increment register address
-#define PCA9685_MODE1_SLEEP   (0x10)
-#define PCA9685_MODE1_RESTART (0x80)
-#define PCA9685_MODE2_OUTDRV  (0x04)  // totem-pole (not open-drain) output
-
-#define SERVO_PWM_CHANNEL  (0)
-#define SERVO_PWM_FREQ_HZ  (50)
+// 2026-07-21: SG92R servo driven by direct GPIO PWM (the ESP32-C3's own
+// LEDC hardware peripheral) on D5, replacing an earlier PCA9685-over-I2C
+// design. Switched for two reasons, both hardware-verified in an isolated
+// bench sketch before being ported here:
+//   1. Removes the I2C bus entirely from the servo path - a raw ledcWrite()
+//      register update measured at 7-40us, vs. an I2C transaction's
+//      inherent overhead, and (more importantly) means the servo can never
+//      again contend with sendTaggedCommand()'s WE2 AT-command traffic for
+//      the shared Wire bus the old design required s_cmd_mutex/
+//      s_i2c_bus_mutex gymnastics to arbitrate safely - see s_cmd_mutex's
+//      own comment for that history.
+//   2. One fewer external part (no PCA9685 board, no I2C wiring to it, no
+//      per-boot register-init sequence or missing-device retry logic).
+// Went through D4 first, then D5 - both hardware-verified working on the
+// bench, D5 is what's actually wired up:
+//   - D4 (GPIO6): earlier in this project's history, D4/D5 were tried as
+//     the WE2 I2C command channel's pins and abandoned after persistent
+//     ESP_ERR_INVALID_STATE ("bus not idle-high") errors (see
+//     initI2CCommandChannel()'s own comment) - that, plus an independent
+//     observation of erratic signals on D4 while this project's own I2C/
+//     UART traffic was active, raised real doubt about whether D4 was
+//     electrically sound. Root-caused on the bench: neither was actually a
+//     D4 hardware fault - the bench sketch's initial "servo doesn't move
+//     at all" turned out to be a servo power/ground wiring issue
+//     (unrelated to any GPIO pin), and once fixed, D4 drove the servo
+//     cleanly and repeatably.
+//   - D5 (GPIO7): freed up by tying the display's panel CS line
+//     permanently to GND in hardware instead of driving it from a GPIO
+//     (valid because the display is the ONLY device on this SPI bus - see
+//     ST7735_XIAO(cs=-1, ...) below and its own constructor comment). D5
+//     has no history of D4's doubts - it had already been reliably driving
+//     the display's CS for this project's entire history before being
+//     freed up for the servo.
+// Every OTHER pin on this board's 11-pin header is already committed:
+// D0/D1 = I2C (WE2 AT-command channel), D2/D3 = display RST/DC, D6/D7 =
+// UART to WE2, D8/D9/D10 = the display's default hardware SPI
+// SCK/MISO/MOSI - D4 remains free (see above for why it's avoided) if this
+// ever needs revisiting.
+#define SERVO_PWM_PIN             (D5)
+#define SERVO_PWM_FREQ_HZ         (50)
+#define SERVO_PWM_RESOLUTION_BITS (14)  // 16384 steps - ample headroom at 50Hz, well under LEDC's freq*2^res limit
 // SG92R datasheet pulse-width range at 50Hz: ~500us (0 deg) - ~2400us
 // (180 deg). If a specific unit's mechanical 0/180 endpoints turn out to
 // grind against the gear stops, narrow this range rather than changing the
@@ -992,7 +998,16 @@ void initI2CCommandChannel() {
 // true physical position after a power cycle is unknown (no feedback), so a
 // single-shot command can be a large, fast, abrupt swing. Ramping from 0
 // covers the full possible range regardless of where it actually started.
-#define SERVO_RAMP_STEP_DEG       (2)
+//
+// 2026-07-21: bumped 2->10 (the top of this project's allowed 1-10 degree
+// step range) - no new "how big should this step be" logic needed for
+// that: rampServoTo()/servoRampPoll() already clamp the final step to
+// whatever's actually left (see servoRampPoll()'s own "don't overshoot"
+// comment), so a sweep just naturally batches into floor(distance/10)
+// full 10-degree steps plus one leftover step of whatever remains - e.g.
+// 0->95 degrees is nine 10-degree steps then one final 5-degree step, with
+// zero extra code beyond changing this constant.
+#define SERVO_RAMP_STEP_DEG       (10)
 #define SERVO_RAMP_STEP_DELAY_MS  (60)
 
 // Tracks the servo's last-commanded angle so motor_left/right_handler()
@@ -1024,61 +1039,25 @@ static std::atomic<int> s_servo_target_angle(SERVO_BOOT_ANGLE);
 #define SERVO_NVS_KEY_ANGLE "angle"
 static Preferences s_servo_prefs;
 
-// 2026-07-19: set explicitly (matches sendTaggedCommand()'s own
-// Wire.setTimeOut(200) on this same shared Wire instance) - without it, a
-// missing/unresponsive PCA9685 (unplugged, no ACK, floating SDA/SCL) can
-// leave Wire.endTransmission() blocking indefinitely, which - called from
-// initServoMotor() during setup() - would hang the entire boot before WiFi/
-// HTTP ever comes up, with zero serial output to explain why. Bounds every
-// I2C op on this bus (WE2 command traffic included) to 200ms.
+// 2026-07-21: with direct GPIO PWM there's no ACK/NACK to probe at boot the
+// way pca9685WriteReg()'s old retry loop did - the ESP32-C3 will happily
+// drive D4 whether or not a real servo is actually connected to it, so
+// this can no longer mean "a real device answered on the bus". Repurposed
+// to mean "did initServoMotor() successfully set up the LEDC peripheral"
+// (see ledcAttach()'s own return value in initServoMotor()) - a much
+// weaker guarantee than the old I2C-probe version, but the closest thing
+// to "is this safe to trust" that a GPIO-only setup can offer.
 static bool s_servo_available = false;
 
-// 2026-07-21: takes s_i2c_bus_mutex itself now (used to rely on callers
-// holding s_cmd_mutex - see that mutex's own comment for why that no longer
-// works now the servo path doesn't take s_cmd_mutex at all). Returns the
-// Wire.endTransmission() status (0 = success) so callers can detect a
-// missing/non-ACKing PCA9685 instead of assuming the write landed.
-static uint8_t pca9685WriteReg(uint8_t reg, uint8_t val) {
-    MutexGuard bus_lock(s_i2c_bus_mutex);
-    Wire.beginTransmission(PCA9685_ADDR);
-    Wire.write(reg);
-    Wire.write(val);
-    return Wire.endTransmission();
-}
-
-// Sets one PWM channel's ON/OFF tick counts (0-4095 across one 4096-tick
-// PWM period). ON is always 0 here (pulse starts at the top of the period),
-// only OFF varies - the datasheet's simplest single-pulse-per-period usage.
-// Takes s_i2c_bus_mutex itself - see pca9685WriteReg()'s own comment.
-//
-// 2026-07-21: now returns the Wire.endTransmission() status (previously
-// discarded) so a NACK/timeout here is at least detectable if a caller ever
-// wants to check it - a live sweep is a repeated string of these calls with
-// the servo physically under load, and this was previously invisible
-// (silently eating up to Wire.setTimeOut(200)'s 200ms inside loopTask with
-// zero log trace). Investigated as a candidate root cause for a client-side
-// stream latency correlation this session; hardware-measured clean (no
-// errors, all calls under threshold) - the actual culprit turned out to be
-// stepServoAngle()'s display redraw instead, see its own comment.
-static uint8_t pca9685SetPwm(uint8_t channel, uint16_t on, uint16_t off) {
-    MutexGuard bus_lock(s_i2c_bus_mutex);
-    uint8_t    base = PCA9685_REG_LED0_ON_L + 4 * channel;
-    Wire.beginTransmission(PCA9685_ADDR);
-    Wire.write(base);
-    Wire.write(on & 0xFF);
-    Wire.write(on >> 8);
-    Wire.write(off & 0xFF);
-    Wire.write(off >> 8);
-    return Wire.endTransmission();
-}
-
-// Converts a 0-180 degree angle into the PCA9685 tick count (0-4095 across
-// one 20ms/50Hz period) for the SG92R pulse-width range above. Pure
-// function, no I2C/locking.
-static uint16_t servoAngleToTicks(int angle) {
-    uint32_t pulse_us = SERVO_MIN_PULSE_US + ((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * angle) /
-                                                  SERVO_MAX_ANGLE;
-    return (uint16_t)((pulse_us * 4096UL) / (1000000UL / SERVO_PWM_FREQ_HZ));
+// Converts a 0-180 degree angle into an LEDC duty value (0 to
+// 2^SERVO_PWM_RESOLUTION_BITS - 1) for the SG92R pulse-width range above.
+// Pure function, no I2C/locking - direct GPIO PWM has none of that to take.
+static uint32_t servoAngleToDuty(int angle) {
+    uint32_t pulse_us  = SERVO_MIN_PULSE_US + ((uint32_t)(SERVO_MAX_PULSE_US - SERVO_MIN_PULSE_US) * angle) /
+                                                   SERVO_MAX_ANGLE;
+    uint32_t period_us = 1000000UL / SERVO_PWM_FREQ_HZ;
+    uint32_t max_duty  = (1UL << SERVO_PWM_RESOLUTION_BITS) - 1;
+    return (uint32_t)(((uint64_t)pulse_us * max_duty) / period_us);
 }
 
 // Steps from from_angle to to_angle in SERVO_RAMP_STEP_DEG increments
@@ -1091,20 +1070,19 @@ static void rampServoTo(int from_angle, int to_angle) {
     int step = (to_angle >= from_angle) ? SERVO_RAMP_STEP_DEG : -SERVO_RAMP_STEP_DEG;
     int a    = from_angle;
     while ((step > 0 && a < to_angle) || (step < 0 && a > to_angle)) {
-        pca9685SetPwm(SERVO_PWM_CHANNEL, 0, servoAngleToTicks(a));
+        ledcWrite(SERVO_PWM_PIN, servoAngleToDuty(a));
         delay(SERVO_RAMP_STEP_DELAY_MS);
         a += step;
     }
-    pca9685SetPwm(SERVO_PWM_CHANNEL, 0, servoAngleToTicks(to_angle));
+    ledcWrite(SERVO_PWM_PIN, servoAngleToDuty(to_angle));
 }
 
 // Applies delta (+/-SERVO_STEP_DEG, from motor_left/right_handler, or a
 // ramp step from servoRampPoll()) to the tracked angle, clamped to
 // [SERVO_MIN_ANGLE, SERVO_MAX_ANGLE] so the SG92R can never be commanded
 // past its physical 0-180 range. Read-modify-write of s_servo_angle happens
-// under s_servo_mutex (not just the I2C write, which pca9685SetPwm() itself
-// further guards with s_i2c_bus_mutex) so two concurrent step requests
-// can't race on the read and silently drop a step.
+// under s_servo_mutex so two concurrent step requests can't race on the
+// read and silently drop a step.
 //
 // 2026-07-21: `persist` lets the caller defer both the NVS write AND the
 // display redraw instead of doing them on every single call - see
@@ -1162,23 +1140,23 @@ static int stepServoAngle(int delta, bool persist) {
     } else if (angle > SERVO_MAX_ANGLE) {
         angle = SERVO_MAX_ANGLE;
     }
-    // Skip the actual I2C write if init never found a PCA9685 (see
-    // initServoMotor()) - still safe to call even so, now that
-    // Wire.setTimeOut(200) bounds it, but there's no point blocking an httpd
-    // worker for up to 200ms against hardware known not to be there.
+    // Skip the write if initServoMotor() never got the LEDC peripheral set
+    // up (see s_servo_available's own comment) - direct GPIO PWM has no
+    // "is anything really out there" check the way the old I2C write did,
+    // this is purely "did our own setup succeed".
     if (s_servo_available) {
-        pca9685SetPwm(SERVO_PWM_CHANNEL, 0, servoAngleToTicks(angle));
+        ledcWrite(SERVO_PWM_PIN, servoAngleToDuty(angle));
     }
     s_servo_angle.store(angle);
     if (persist) {
         s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, angle);
-        // "--" (not a possibly-misleading number) if there's no PCA9685 to
-        // actually be holding this position - matches s_servo_available's
-        // own gating of the real PWM write just above. Only reached here on
-        // the step that actually settles (manual step, or a ramp's final
-        // step) - see this function's own comment for why intermediate ramp
-        // steps skip this entirely instead of merely rate-limiting it or
-        // moving it to another task.
+        // "--" (not a possibly-misleading number) if LEDC setup itself
+        // failed - matches s_servo_available's own gating of the real PWM
+        // write just above. Only reached here on the step that actually
+        // settles (manual step, or a ramp's final step) - see this
+        // function's own comment for why intermediate ramp steps skip this
+        // entirely instead of merely rate-limiting it or moving it to
+        // another task.
         displayShowMotorAngle(s_servo_available ? angle : -1);
     }
     return angle;
@@ -1200,12 +1178,14 @@ static int stepServoAngle(int delta, bool persist) {
 // drains WE2's UART (see loopTask's own priority-bump comment in
 // camera_web_server.ino) - so stepServoAngle() blocking here for any
 // meaningful time would stall UART draining right along with it. That's
-// exactly why the servo path was split onto its own s_servo_mutex +
-// s_i2c_bus_mutex instead of continuing to share s_cmd_mutex with
-// sendTaggedCommand(): the old shared mutex meant a ramp step could block
-// this task for up to RESULT_TIMEOUT_MS (8000ms) behind an in-flight AT
-// command's reply-wait poll, even though that poll never touches the I2C
-// bus - see s_cmd_mutex's own comment.
+// exactly why the servo path was split onto its own s_servo_mutex instead
+// of continuing to share s_cmd_mutex with sendTaggedCommand(): the old
+// shared mutex meant a ramp step could block this task for up to
+// RESULT_TIMEOUT_MS (8000ms) behind an in-flight AT command's reply-wait
+// poll - see s_cmd_mutex's own comment. (A short-lived s_i2c_bus_mutex
+// existed briefly in between as an intermediate fix, back when the servo
+// was still PCA9685-over-I2C; moving the servo to direct GPIO PWM removed
+// the I2C bus from this path entirely, and that mutex along with it.)
 void servoRampPoll() {
     static uint32_t s_last_step_ms = 0;
     int              target        = s_servo_target_angle.load();
@@ -1241,17 +1221,15 @@ void servoRampPoll() {
     stepServoAngle(delta, reaches_target);
 }
 
-// Initializes the PCA9685 at 50Hz (standard analog-servo update rate) and
-// drives the SG92R to its centered boot position. Must run after
-// initI2CCommandChannel()'s Wire.begin(D0, D1) - reuses that same bus/pins,
-// does not call Wire.begin() again. Tolerates a missing/unresponsive
-// PCA9685 (logs a warning and leaves s_servo_available false) instead of
-// blocking boot - see s_servo_available's own comment for why this matters.
+// Sets up the LEDC PWM peripheral on SERVO_PWM_PIN and drives the SG92R to
+// its centered boot position. Much simpler than the old PCA9685-over-I2C
+// version - no register-init sequence, no missing-device retry loop, since
+// there's no external chip to initialize or fail to ACK anymore.
 void initServoMotor() {
     // Nothing else can be calling stepServoAngle()/servoRampPoll() yet at
-    // this point in setup() (httpd isn't started until after this returns),
-    // so this lock is just for consistency with every other PCA9685 access
-    // path, not a real concurrency concern here.
+    // this point in setup() (httpd isn't started until after this
+    // returns), so this lock is just for consistency with every other
+    // servo-PWM access path, not a real concurrency concern here.
     MutexGuard servo_lock(s_servo_mutex);
 
     s_servo_prefs.begin(SERVO_NVS_NAMESPACE, /*readOnly=*/false);
@@ -1268,39 +1246,15 @@ void initServoMotor() {
         last_angle = SERVO_MAX_ANGLE;
     }
 
-    Wire.setTimeOut(200);
-
-    // 2026-07-19: retry a few times before giving up - hardware-verified
-    // that a real, correctly-wired PCA9685 can still get one transient
-    // ESP_ERR_INVALID_STATE (err 4) on the very first I2C write attempted
-    // right after this point in setup() (heap freshly fragmented by WiFi
-    // connect + the 32KB UART RX buffer from startRemoteProxy() just
-    // before), with every retry seconds later succeeding fine - so this
-    // isn't a real absence/wiring fault, just a momentary resource clash.
-    uint8_t err = 0;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        err = pca9685WriteReg(PCA9685_REG_MODE1, PCA9685_MODE1_SLEEP);  // must sleep before changing PRESCALE
-        if (err == 0) {
-            break;
-        }
-        delay(20);
-    }
-    if (err != 0) {
-        log_w("initServoMotor: PCA9685 not responding after retries (I2C err %u) - servo control disabled", err);
+    // See s_servo_available's own comment - this is a peripheral-setup
+    // check, not a "is a real servo out there" check (GPIO PWM can't tell
+    // the difference between a connected servo and an open wire).
+    s_servo_available = ledcAttach(SERVO_PWM_PIN, SERVO_PWM_FREQ_HZ, SERVO_PWM_RESOLUTION_BITS);
+    if (!s_servo_available) {
+        log_w("initServoMotor: ledcAttach() failed on pin %d - servo control disabled", (int)SERVO_PWM_PIN);
         displayShowMotorAngle(-1);
         return;
     }
-    delay(5);
-
-    // prescale = round(25MHz internal osc / (4096 * update_rate)) - 1, per
-    // the PCA9685 datasheet's own formula.
-    uint8_t prescale = (uint8_t)((25000000UL / (4096UL * SERVO_PWM_FREQ_HZ)) - 1);
-    pca9685WriteReg(PCA9685_REG_PRESCALE, prescale);
-
-    pca9685WriteReg(PCA9685_REG_MODE1, PCA9685_MODE1_AI);
-    delay(5);
-    pca9685WriteReg(PCA9685_REG_MODE1, PCA9685_MODE1_AI | PCA9685_MODE1_RESTART);
-    pca9685WriteReg(PCA9685_REG_MODE2, PCA9685_MODE2_OUTDRV);
 
     // Slow, stepped ramp from wherever it last was to the centered boot
     // position - see SERVO_RAMP_STEP_DEG's and last_angle's own comments
@@ -1308,7 +1262,6 @@ void initServoMotor() {
     rampServoTo(last_angle, SERVO_BOOT_ANGLE);
     s_servo_angle.store(SERVO_BOOT_ANGLE);
     s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, SERVO_BOOT_ANGLE);
-    s_servo_available = true;
     displayShowMotorAngle(SERVO_BOOT_ANGLE);
 }
 
@@ -1316,7 +1269,7 @@ void initServoMotor() {
 // 2026-07-19: ST7735 128x128 SPI status display (user-supplied, hardware-
 // verified ST7735_XIAO.cpp/.h - see that file for the actual panel driver).
 // Shows the board's WiFi IP and whether a /stream/data client is currently
-// connected. CS/DC/RST are plain GPIO (per ST7735_XIAO's own design, not
+// connected. DC/RST are plain GPIO (per ST7735_XIAO's own design, not
 // hardware-auto CS) so any pins work; SCK/MOSI use the board's default
 // hardware SPI pins (D8/D10 on XIAO ESP32C3) since nothing else on this
 // board uses hardware SPI (startRemoteProxy()'s PROTO_SPI case is dead code
@@ -1328,7 +1281,13 @@ void initServoMotor() {
 // startRemoteProxy() early in setup(), and initDisplay() is only called
 // afterward (see camera_web_server.ino's setup()), by which point D3 is
 // already idle/available for the display to drive as an output.
-#define DISPLAY_CS_PIN  (D5)
+//
+// 2026-07-21: DISPLAY_CS_PIN is -1 (no GPIO control) - the panel's CS line
+// is tied permanently to GND in hardware instead, freeing D5 for the servo
+// PWM signal (see SERVO_PWM_PIN's own comment for the full pin history).
+// Only valid because this display is the ONLY device on the SPI bus - see
+// ST7735_XIAO's own constructor comment.
+#define DISPLAY_CS_PIN  (-1)
 #define DISPLAY_DC_PIN  (D3)
 #define DISPLAY_RST_PIN (D2)
 
@@ -1361,7 +1320,7 @@ void initDisplay() {
     s_display.drawText(2, 52, "WAITING   ", DISPLAY_COLOR_YELLOW, 2, DISPLAY_COLOR_BLACK, true);
     // Placeholder until initServoMotor() (called after initDisplay() in
     // camera_web_server.ino's setup()) determines the real angle - or
-    // decides the PCA9685 isn't responding at all, see
+    // decides the LEDC PWM setup itself failed, see
     // displayShowMotorAngle()'s own negative-angle case.
     s_display.drawText(2, 90, "--       ", DISPLAY_COLOR_WHITE, 2, DISPLAY_COLOR_BLACK, true);
 }
@@ -1394,7 +1353,7 @@ void displayShowClientStatus(bool connected) {
     }
 }
 
-// angle < 0 means "no PCA9685 responding" (see s_servo_available) - shown
+// angle < 0 means "LEDC PWM setup failed" (see s_servo_available) - shown
 // as "--" rather than a number that would otherwise look like a real,
 // currently-held position.
 void displayShowMotorAngle(int angle) {
@@ -2922,27 +2881,20 @@ static SlotRef sendTaggedCommand(const char* body, size_t body_len, char* cmd_ta
     // underlying i2c_master_transmit() call, or the hang is somewhere else
     // entirely - this will show definitively which.
     //
-    // 2026-07-21: this block now takes s_i2c_bus_mutex of its own accord
-    // (scoped, released the instant the transmission finishes) instead of
-    // relying on s_cmd_mutex (still held for the whole outer function) to
-    // arbitrate the bus - see s_i2c_bus_mutex's own comment. Two concurrent
-    // sendTaggedCommand() callers still can't reach this point at the same
-    // time regardless (s_cmd_mutex already serializes the whole function),
-    // so the only thing this actually adds exclusion against is a servo I2C
-    // write landing mid-transmission.
-    uint8_t i2c_err;
-    {
-        MutexGuard bus_lock(s_i2c_bus_mutex);
-        Serial.printf("sendTaggedCommand: before Wire I2C send, tag=%s\r\n", cmd_tag_buf);
-        Wire.setTimeOut(200);
-        Wire.beginTransmission(WE2_I2C_CMD_ADDR);
-        Wire.write((const uint8_t*)CMD_PREFIX, strlen(CMD_PREFIX));
-        Wire.write((const uint8_t*)cmd_tag_buf, cmd_tag_size);
-        Wire.write((const uint8_t*)body, body_len);
-        Wire.write((const uint8_t*)CMD_SUFFIX, strlen(CMD_SUFFIX));
-        i2c_err = Wire.endTransmission();
-        Serial.printf("sendTaggedCommand: after Wire I2C send, tag=%s, err=%u\r\n", cmd_tag_buf, (unsigned)i2c_err);
-    }
+    // 2026-07-21: no separate bus-arbitration lock needed here anymore -
+    // the servo moved off I2C entirely (direct GPIO PWM, see
+    // SERVO_PWM_PIN), so this Wire bus now has exactly one user
+    // (sendTaggedCommand() itself), and s_cmd_mutex already serializes
+    // concurrent callers of this whole function.
+    Serial.printf("sendTaggedCommand: before Wire I2C send, tag=%s\r\n", cmd_tag_buf);
+    Wire.setTimeOut(200);
+    Wire.beginTransmission(WE2_I2C_CMD_ADDR);
+    Wire.write((const uint8_t*)CMD_PREFIX, strlen(CMD_PREFIX));
+    Wire.write((const uint8_t*)cmd_tag_buf, cmd_tag_size);
+    Wire.write((const uint8_t*)body, body_len);
+    Wire.write((const uint8_t*)CMD_SUFFIX, strlen(CMD_SUFFIX));
+    uint8_t i2c_err = Wire.endTransmission();
+    Serial.printf("sendTaggedCommand: after Wire I2C send, tag=%s, err=%u\r\n", cmd_tag_buf, (unsigned)i2c_err);
     if (i2c_err != 0) {
         Serial.printf("sendTaggedCommand: I2C write failed, err=%u\r\n", (unsigned)i2c_err);
     }
@@ -3413,8 +3365,8 @@ static esp_err_t audio_stop_handler(httpd_req_t* req) {
     return httpd_resp_send(req, (const char*)slot->data, slot->size);
 }
 
-/* 2026-07-19: PCA9685/SG92R servo control (see initServoMotor()'s comment
- * above for the driver itself). Client never sends an angle or step count -
+/* 2026-07-19: SG92R servo control via direct GPIO PWM (see initServoMotor()'s
+ * comment above for the driver itself). Client never sends an angle or step count -
  * it only ever calls /motor/left or /motor/right some number of times over
  * WiFi, and each call is exactly one SERVO_STEP_DEG (2 degree) step,
  * clamped to [0,180] by stepServoAngle(). Direction convention (left =
