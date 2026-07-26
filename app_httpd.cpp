@@ -930,20 +930,27 @@ void initI2CCommandChannel() {
     // once WiFi/HTTP had already claimed most of the heap: "[E][Wire.cpp]
     // allocateWireBuffer(): Can't allocate memory for I2C_0 txBuffer".
     Wire.setBufferSize(512);
-    // 2026-07-17: moved off the default D4(SDA)/D5(SCL) - i2c_master_transmit
-    // kept failing with ESP_ERR_INVALID_STATE (bus not idle-high at transmit
-    // time) on D4/D5 even after checking pull-ups/GND against real WE2
-    // hardware, so trying a different ESP32 pin pair per user's direction.
-    // D0=GPIO2 is an ESP32-C3 strapping pin - fine here since this only
-    // matters during the boot/reset window, not during normal operation
-    // long after boot. WE2 side (i2c_cmd.c) is unchanged - still PA2/PA3 -
-    // only the physical wire's ESP32 endpoint moves, from D4/D5 to D0/D1.
+    // 2026-07-26: briefly tried moving back to the native D4(SDA)/D5(SCL)
+    // pins on the theory that the original ESP_ERR_INVALID_STATE ("bus not
+    // idle-high") failures were specific to the old, since-replaced
+    // ESP32-C3 board - disproven on hardware: the *new* board hit the exact
+    // same intermittent ESP_ERR_INVALID_STATE on D4/D5, with pull-ups
+    // (4.3k to 3.3V - NOT 5V, ESP32-C3/WE2 I2C is 3.3V logic and not 5V-
+    // tolerant) confirmed present and a full power-cycle of both boards
+    // ruled out a stuck-bus leftover from an interrupted transaction. Two
+    // separate boards failing identically on D4/D5 points at something
+    // more systematic than one bad board - not chased further; reverted to
+    // D0/D1, the only configuration actually proven stable across both
+    // boards. WE2 side (i2c_cmd.c) is unchanged - still PA2/PA3 - only the
+    // physical wire's ESP32 endpoint moves. D0=GPIO2 is an ESP32-C3
+    // strapping pin - fine here since this only matters during the boot/
+    // reset window, not during normal operation long after boot.
     Wire.begin(D0, D1);  // master mode, SDA=D0(GPIO2), SCL=D1(GPIO3)
 }
 
 // ---------------------------------------------------------------------------
 // 2026-07-21: SG92R servo driven by direct GPIO PWM (the ESP32-C3's own
-// LEDC hardware peripheral) on D5, replacing an earlier PCA9685-over-I2C
+// LEDC hardware peripheral), replacing an earlier PCA9685-over-I2C
 // design. Switched for two reasons, both hardware-verified in an isolated
 // bench sketch before being ported here:
 //   1. Removes the I2C bus entirely from the servo path - a raw ledcWrite()
@@ -955,8 +962,7 @@ void initI2CCommandChannel() {
 //      own comment for that history.
 //   2. One fewer external part (no PCA9685 board, no I2C wiring to it, no
 //      per-boot register-init sequence or missing-device retry logic).
-// Went through D4 first, then D5 - both hardware-verified working on the
-// bench, D5 is what's actually wired up:
+// Went through D4, then D5, then briefly D2, now back to D4:
 //   - D4 (GPIO6): earlier in this project's history, D4/D5 were tried as
 //     the WE2 I2C command channel's pins and abandoned after persistent
 //     ESP_ERR_INVALID_STATE ("bus not idle-high") errors (see
@@ -967,20 +973,25 @@ void initI2CCommandChannel() {
 //     D4 hardware fault - the bench sketch's initial "servo doesn't move
 //     at all" turned out to be a servo power/ground wiring issue
 //     (unrelated to any GPIO pin), and once fixed, D4 drove the servo
-//     cleanly and repeatably.
+//     cleanly and repeatably. D4 was picked again as the current pin for
+//     exactly this reason - it's the one already bench-verified clean.
 //   - D5 (GPIO7): freed up by tying the display's panel CS line
 //     permanently to GND in hardware instead of driving it from a GPIO
 //     (valid because the display is the ONLY device on this SPI bus - see
-//     ST7735_XIAO(cs=-1, ...) below and its own constructor comment). D5
-//     has no history of D4's doubts - it had already been reliably driving
-//     the display's CS for this project's entire history before being
-//     freed up for the servo.
-// Every OTHER pin on this board's 11-pin header is already committed:
-// D0/D1 = I2C (WE2 AT-command channel), D2/D3 = display RST/DC, D6/D7 =
-// UART to WE2, D8/D9/D10 = the display's default hardware SPI
-// SCK/MISO/MOSI - D4 remains free (see above for why it's avoided) if this
-// ever needs revisiting.
-#define SERVO_PWM_PIN             (D5)
+//     ST7735_XIAO(cs=-1, ...) below and its own constructor comment). Used
+//     for the servo until the WE2 I2C command channel briefly moved onto
+//     D4/D5 (see initI2CCommandChannel()'s comment for why that didn't
+//     stick), which took D5 back.
+//   - D2 (GPIO4): used briefly while the display's DC/RST were on D0/D1
+//     (freed by that same brief D4/D5 I2C move) - abandoned along with it
+//     when I2C reverted to D0/D1 and DC/RST moved to D2/D3 instead.
+// Every OTHER pin on this board's 11-pin header is now committed: D0/D1 =
+// I2C (WE2 AT-command channel), D2/D3 = display DC/RST, D4 = servo,
+// D6/D7 = UART from WE2, D8/D9/D10 = the display's default hardware SPI
+// SCK/MISO/MOSI. D3's old "WE2 reset" AI.begin() argument turned out to be
+// a no-op (a Seeed_Arduino_SSCMA library bug - see DISPLAY_RST_PIN's
+// comment), so wiring it to the display's RST line instead has no conflict.
+#define SERVO_PWM_PIN             (D4)
 #define SERVO_PWM_FREQ_HZ         (50)
 #define SERVO_PWM_RESOLUTION_BITS (14)  // 16384 steps - ample headroom at 50Hz, well under LEDC's freq*2^res limit
 // SG92R datasheet pulse-width range at 50Hz: ~500us (0 deg) - ~2400us
@@ -1275,21 +1286,28 @@ void initServoMotor() {
 // board uses hardware SPI (startRemoteProxy()'s PROTO_SPI case is dead code
 // - PROTO_UART is what's actually selected).
 //
-// Pin note: DISPLAY_DC_PIN (D3) is the same pin AI.begin(&atSerial, D3)
-// (see startRemoteProxy()'s PROTO_UART case) uses as WE2's reset line - not
-// a real conflict since that use is a one-shot pulse-then-INPUT during
-// startRemoteProxy() early in setup(), and initDisplay() is only called
-// afterward (see camera_web_server.ino's setup()), by which point D3 is
-// already idle/available for the display to drive as an output.
-//
 // 2026-07-21: DISPLAY_CS_PIN is -1 (no GPIO control) - the panel's CS line
-// is tied permanently to GND in hardware instead, freeing D5 for the servo
-// PWM signal (see SERVO_PWM_PIN's own comment for the full pin history).
-// Only valid because this display is the ONLY device on the SPI bus - see
-// ST7735_XIAO's own constructor comment.
+// is tied permanently to GND in hardware instead. Only valid because this
+// display is the ONLY device on the SPI bus - see ST7735_XIAO's own
+// constructor comment.
+//
+// 2026-07-26: DC=D2/RST=D3 (briefly D0/D1 during a since-reverted attempt
+// to move the WE2 I2C channel onto D4/D5 - see initI2CCommandChannel()'s
+// comment - I2C is back on D0/D1, so DC/RST moved to D2/D3 instead). RST
+// on D3 specifically is safe despite D3 ALSO being AI.begin(&atSerial,
+// D3)'s WE2 reset-pulse argument (startRemoteProxy()'s PROTO_UART case):
+// that pulse never actually happens. Confirmed by reading
+// Seeed_Arduino_SSCMA.cpp - its HardwareSerial overload of begin() reads
+// `_rst` to decide whether to drive the pin, but (unlike the TwoWire/
+// SPIClass overloads, which both do) never assigns `_rst = rst` first, so
+// `_rst` stays at the constructor's -1 default and the `if (_rst >= 0)`
+// reset block never runs, regardless of what pin is passed. This is a
+// library bug, confirmed by source inspection rather than by observed
+// misbehavior - nothing here ever relied on that pulse actually happening
+// - so ST7735_XIAO driving D3 as RST has no real conflict with it.
 #define DISPLAY_CS_PIN  (-1)
-#define DISPLAY_DC_PIN  (D3)
-#define DISPLAY_RST_PIN (D2)
+#define DISPLAY_DC_PIN  (D2)
+#define DISPLAY_RST_PIN (D3)
 
 #define DISPLAY_COLOR_BLACK  (0x0000)
 #define DISPLAY_COLOR_WHITE  (0xFFFF)
@@ -3261,6 +3279,37 @@ static esp_err_t camera_stop_handler(httpd_req_t* req) {
     return httpd_resp_send(req, (const char*)slot->data, slot->size);
 }
 
+/* 2026-07-26: AT+ROTATE - rotates WE2's AI model input only (0/90/180/270
+ * deg); the JPEG preview stream is unaffected, see WE2-side sscma_cam_mic.h's
+ * app_set_ai_rotate() comment. Query param: value=0|1|2|3 (required, 400 if
+ * missing/out of range). Mirrors camera_start_handler's single-command
+ * relay pattern - just forwards the reply body straight through. */
+static esp_err_t camera_rotate_handler(httpd_req_t* req) {
+    if (!checkAuth(req)) {
+        return ESP_FAIL;
+    }
+    char value_str[16];
+    query_param(req, "value", value_str, sizeof(value_str), "");
+    int  value = atoi(value_str);
+    if (value_str[0] == '\0' || value < 0 || value > 3) {
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    char cmd_buf[32];
+    char cmd_tag_buf[32] = {0};
+    int  n    = snprintf(cmd_buf, sizeof(cmd_buf), "ROTATE=%d", value);
+    auto slot = sendTaggedCommand(cmd_buf, n, cmd_tag_buf, sizeof(cmd_tag_buf));
+    if (slot == nullptr) {
+        log_w("camera_rotate: AT+ROTATE reply timeout...");
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, (const char*)slot->data, slot->size);
+}
+
 /* TEMP DIAGNOSTIC (2026-07-17): lets a test script poll ESP32-side heap over
  * HTTP/curl instead of the USB-CDC debug console - the console has proven
  * unreliable for long/multi-cycle tests this session (see
@@ -3504,6 +3553,18 @@ void startCameraServer() {
 #endif
     };
 
+    httpd_uri_t camera_rotate_uri = {.uri      = "/camera/rotate",
+                                     .method   = HTTP_GET,
+                                     .handler  = camera_rotate_handler,
+                                     .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+                                     ,
+                                     .is_websocket             = true,
+                                     .handle_ws_control_frames = false,
+                                     .supported_subprotocol    = NULL
+#endif
+    };
+
     httpd_uri_t heap_uri = {.uri      = "/heap",
                             .method   = HTTP_GET,
                             .handler  = heap_handler,
@@ -3598,6 +3659,7 @@ void startCameraServer() {
         ret |= httpd_register_uri_handler(web_httpd, &command_uri);
         ret |= httpd_register_uri_handler(web_httpd, &camera_start_uri);
         ret |= httpd_register_uri_handler(web_httpd, &camera_stop_uri);
+        ret |= httpd_register_uri_handler(web_httpd, &camera_rotate_uri);
         ret |= httpd_register_uri_handler(web_httpd, &heap_uri);
         ret |= httpd_register_uri_handler(web_httpd, &audio_start_uri);
         ret |= httpd_register_uri_handler(web_httpd, &audio_stop_uri);

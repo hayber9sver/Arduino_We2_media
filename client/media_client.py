@@ -13,6 +13,11 @@ Endpoints used (all against --host, default port 80 unless noted):
                                       2=640x480 (confirmed against this
                                       board/model - re-verify per app if the
                                       firmware ever changes model/sensor)
+    GET /camera/rotate?value=0|1|2|3
+                                    - 0/90/180/270deg clockwise, AI-input
+                                      only (preview image unaffected). Sent
+                                      once before /camera/start, same as
+                                      resolution - see --rotate below.
     GET /camera/stop
     GET /audio/start?rate=16000|32000
     GET /audio/stop
@@ -40,8 +45,8 @@ Endpoints used (all against --host, default port 80 unless noted):
 
 Usage:
     media_client.py start --host 192.168.1.112 --outdir ./capture \\
-        [--camera] [--audio] [--resolution 0|1|2] [--rate 16000|32000] \\
-        [--user <user>] [--password <password>]
+        [--camera] [--audio] [--resolution 0|1|2] [--rotate 0|1|2|3] \\
+        [--rate 16000|32000] [--user <user>] [--password <password>]
     media_client.py stop [--outdir ./capture]
     media_client.py status [--outdir ./capture]
     media_client.py once --host 192.168.1.112   # one-shot /result check, no capture
@@ -463,7 +468,7 @@ def read_data_stream(base, results_path, wav_path, stop_event, resume_urls=None)
 # Background capture process
 # ---------------------------------------------------------------------------
 
-def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
+def run_capture(host, outdir, want_camera, want_audio, resolution, rate, rotate=0):
     base = f"http://{host}"
     results_path = os.path.join(outdir, "results.jsonl")
     wav_path = os.path.join(outdir, "audio.wav")
@@ -546,6 +551,17 @@ def run_capture(host, outdir, want_camera, want_audio, resolution, rate):
     # camera/audio happens to be running (see its own comment further down),
     # so it's the right recovery action before either start command.
     if want_camera:
+        # Sent before /camera/start, same spirit as resolution: a config
+        # knob that should already be in place once streaming begins, not
+        # something to change mid-stream. Not a "start" command (doesn't
+        # begin a stream, WE2-side just sets a variable - see WE2's
+        # app_set_ai_rotate()), so no recover_url/half-started-stream risk
+        # like start_with_retries' own comment warns about for camera/audio
+        # start - still routed through start_with_retries for the same
+        # UART1-handshake-settling retry tolerance.
+        if rotate:
+            log(f"setting AI-input rotation={rotate}")
+            start_with_retries(base + f"/camera/rotate?value={rotate}")
         log(f"starting camera / AI inference (resolution={resolution})")
         start_with_retries(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0",
                             recover_url=base + "/camera/stop")
@@ -642,7 +658,7 @@ def cmd_start(args):
         f.write(str(os.getpid()))
 
     try:
-        run_capture(args.host, outdir, want_camera, want_audio, args.resolution, args.rate)
+        run_capture(args.host, outdir, want_camera, want_audio, args.resolution, args.rate, args.rotate)
     finally:
         if os.path.exists(pf):
             os.remove(pf)
@@ -717,6 +733,10 @@ def main():
     p_start.add_argument("--audio", action="store_true", help="raw PCM audio via /stream/audio")
     p_start.add_argument("--resolution", type=int, default=2, choices=[0, 1, 2],
                           help="0=240x240, 1=480x480, 2=640x480")
+    p_start.add_argument("--rotate", type=int, default=0, choices=[0, 1, 2, 3],
+                          help="AI-input rotation: 0/1/2/3 = 0/90/180/270deg clockwise. "
+                               "Only affects what the model sees, not the preview image "
+                               "(see app_httpd.cpp's camera_rotate_handler()).")
     p_start.add_argument("--rate", type=int, default=16000, choices=[16000, 32000])
     p_start.add_argument("--user", required=True, help="HTTP Basic Auth username (must match the board's HTTP_AUTH_USER)")
     p_start.add_argument("--password", required=True, help="HTTP Basic Auth password (must match the board's HTTP_AUTH_PASS)")
