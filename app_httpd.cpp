@@ -888,7 +888,29 @@ void startRemoteProxy(Proto through = PROTO_UART) {
         // esp32_camera_web_server_bridge / orangepi_zero3_uart5_i2c3_probe
         // memory - that whole approach was abandoned this session in favor
         // of testing directly against real WE2 hardware).
-        AI.begin(&atSerial, D3);
+        //
+        // 2026-07-26: was AI.begin(&atSerial, D3) - replaced with the two
+        // lines it actually needed. Root-caused a real, recurring crash
+        // (Guru Meditation "Load access fault" in strcpy() inside
+        // SSCMA::ID(bool), Seeed_Arduino_SSCMA.cpp:758): AI.begin()'s
+        // return is `ID(false) && name(false)` - sends AT+ID?/AT+NAME? and
+        // strcpy()s a string out of the JSON reply. This app's custom WE2
+        // firmware replies to AT+ID? with a bare integer, not a string, so
+        // the library ends up strcpy()ing from a pointer that was never
+        // valid - and if WE2 happens to already be mid-stream on UART1
+        // (e.g. it stayed synced with a *previous* ESP32 boot incarnation
+        // across an ESP32-only reset), AI.begin() reads that live traffic
+        // as if it were the AT+ID? reply, guaranteeing garbage input to the
+        // parser. Confirmed nothing in this file ever calls AI.<anything>
+        // again after this - the whole custom I2C/UART1 pipeline
+        // (sendTaggedCommand()/fetchFramedMessages()) "bypasses AI.fetch()
+        // entirely and does its own minimal framing" (see
+        // fetchFramedMessages()'s own comment) - so AI.begin()'s only
+        // actual job here was opening atSerial at the right baud, which
+        // these two lines do directly without the crash-prone ID/name
+        // round-trip its return value was never even checked for anyway.
+        atSerial.begin(SSCMA_UART_BAUD);
+        atSerial.setTimeout(1000);
         s_uart_proto_active = true;
         break;
     }
@@ -1159,6 +1181,13 @@ static int stepServoAngle(int delta, bool persist) {
         ledcWrite(SERVO_PWM_PIN, servoAngleToDuty(angle));
     }
     s_servo_angle.store(angle);
+    // Keep servoRampPoll()'s target in sync with a manual step (motor_left/
+    // right_handler) - otherwise the stale target left over from the last
+    // /motor/set (or the boot angle, if /motor/set was never called) still
+    // differs from the angle just written here, and the next loop() tick's
+    // servoRampPoll() "corrects" it by ramping straight back to that stale
+    // target, undoing the manual step a moment later.
+    s_servo_target_angle.store(angle);
     if (persist) {
         s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, angle);
         // "--" (not a possibly-misleading number) if LEDC setup itself

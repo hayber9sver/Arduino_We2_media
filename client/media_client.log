@@ -1,0 +1,204 @@
+[00:54:03] starting camera / AI inference (resolution=2)
+[00:54:14] received stop signal, shutting down...
+[00:54:33] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 1/5): timed out
+[00:55:36] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 2/5): timed out
+[00:55:38] starting audio (rate=32000)
+[00:55:38] data reader stopped, 0 detection batches + 0 audio frames saved, 0 CRC mismatches dropped
+[00:55:39] capture stopped
+[00:55:43] starting camera / AI inference (resolution=2)
+[00:55:44] starting audio (rate=32000)
+[00:55:46] data reader: TIMING resp.read() took 1773ms
+[00:55:47] data reader: TIMING resp.read() took 869ms
+[00:55:48] data reader: TIMING resp.read() took 940ms
+[00:55:49] data reader: TIMING resp.read() took 944ms
+[00:55:50] data reader: TIMING resp.read() took 955ms
+[00:55:51] data reader: TIMING resp.read() took 1205ms
+[00:55:52] received stop signal, shutting down...
+[00:55:53] data reader: TIMING resp.read() took 1113ms
+[00:55:53] data reader stopped, 0 detection batches + 57 audio frames saved, 0 CRC mismatches dropped
+[00:55:53] capture stopped
+[01:04:17] starting camera / AI inference (resolution=2)
+[01:04:17] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 1/5): <urlopen error [Errno 111] Connection refused>
+[01:04:20] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 2/5): <urlopen error [Errno 111] Connection refused>
+[01:04:22] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 3/5): <urlopen error [Errno 111] Connection refused>
+[01:04:25] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 4/5): <urlopen error [Errno 111] Connection refused>
+[01:04:30] received stop signal, shutting down...
+[01:05:19] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 5/5): timed out
+Traceback (most recent call last):
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 764, in <module>
+    main()
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 760, in main
+    sys.exit(args.func(args) or 0)
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 661, in cmd_start
+    run_capture(args.host, outdir, want_camera, want_audio, args.resolution, args.rate, args.rotate)
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 566, in run_capture
+    start_with_retries(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0",
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 544, in start_with_retries
+    raise RuntimeError(f"giving up on {url} after {attempts} attempts: {last_err}")
+RuntimeError: giving up on http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 after 5 attempts: timed out
+[01:07:57] starting camera / AI inference (resolution=2)
+[01:08:10] received stop signal, shutting down...
+[01:08:17] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 1/5): HTTP Error 500: Internal Server Error
+[01:08:45] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 2/5): HTTP Error 500: Internal Server Error
+[01:09:25] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 3/5): <urlopen error [Errno 111] Connection refused>
+[01:09:28] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 4/5): <urlopen error [Errno 111] Connection refused>
+[01:09:30] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 5/5): <urlopen error [Errno 111] Connection refused>
+Traceback (most recent call last):
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 764, in <module>
+    main()
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 760, in main
+    sys.exit(args.func(args) or 0)
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 661, in cmd_start
+    run_capture(args.host, outdir, want_camera, want_audio, args.resolution, args.rate, args.rotate)
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 566, in run_capture
+    start_with_retries(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0",
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 544, in start_with_retries
+    raise RuntimeError(f"giving up on {url} after {attempts} attempts: {last_err}")
+RuntimeError: giving up on http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 after 5 attempts: <urlopen error [Errno 111] Connection refused>
+[01:39:56] starting camera / AI inference (resolution=2)
+[01:39:56] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 1/5): <urlopen error [Errno 111] Connection refused>
+[01:39:59] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 2/5): <urlopen error [Errno 111] Connection refused>
+[01:40:13] received stop signal, shutting down...
+[01:40:53] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 3/5): timed out
+[01:41:51] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 4/5): timed out
+[01:42:53] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 5/5): timed out
+Traceback (most recent call last):
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 764, in <module>
+    main()
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 760, in main
+    sys.exit(args.func(args) or 0)
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 661, in cmd_start
+    run_capture(args.host, outdir, want_camera, want_audio, args.resolution, args.rate, args.rotate)
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 566, in run_capture
+    start_with_retries(base + f"/camera/start?resolution={resolution}&mode=invoke&differed=0",
+  File "/home/orangepi/Arduino_We2_media/client/media_client.py", line 544, in start_with_retries
+    raise RuntimeError(f"giving up on {url} after {attempts} attempts: {last_err}")
+RuntimeError: giving up on http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 after 5 attempts: timed out
+[01:45:27] starting camera / AI inference (resolution=2)
+[01:45:28] starting audio (rate=32000)
+[01:45:30] data reader: TIMING resp.read() took 1099ms
+[01:45:31] data reader: TIMING resp.read() took 1198ms
+[01:45:32] data reader: TIMING resp.read() took 975ms
+[01:45:33] data reader: TIMING resp.read() took 1160ms
+[01:45:34] data reader: TIMING resp.read() took 1206ms
+[01:45:35] received stop signal, shutting down...
+[01:45:45] capture stopped
+[01:47:13] starting camera / AI inference (resolution=2)
+[01:47:13] starting audio (rate=32000)
+[01:47:14] data reader: TIMING resp.read() took 1020ms
+[01:47:15] data reader: TIMING resp.read() took 932ms
+[01:47:17] data reader: TIMING resp.read() took 864ms
+[01:47:18] data reader: TIMING resp.read() took 963ms
+[01:47:19] data reader: TIMING resp.read() took 950ms
+[01:47:20] data reader: TIMING resp.read() took 1167ms
+[01:47:20] received stop signal, shutting down...
+[01:47:30] data reader: TIMING resp.read() took 10462ms
+[01:47:30] capture stopped
+[01:48:00] starting camera / AI inference (resolution=2)
+[01:48:00] starting audio (rate=32000)
+[01:48:02] data reader: TIMING resp.read() took 1016ms
+[01:48:03] data reader: TIMING resp.read() took 935ms
+[01:48:04] data reader: TIMING resp.read() took 941ms
+[01:48:05] data reader: TIMING resp.read() took 1210ms
+[01:48:06] data reader: TIMING resp.read() took 1183ms
+[01:48:07] data reader: TIMING resp.read() took 944ms
+[01:48:08] data reader: TIMING resp.read() took 1176ms
+[01:48:10] data reader: TIMING resp.read() took 910ms
+[01:48:11] data reader: TIMING resp.read() took 1182ms
+[01:48:12] data reader: TIMING resp.read() took 1134ms
+[01:48:13] data reader: TIMING resp.read() took 1185ms
+[01:48:14] data reader: TIMING resp.read() took 975ms
+[01:48:16] data reader: TIMING resp.read() took 1168ms
+[01:48:17] data reader: TIMING resp.read() took 1211ms
+[01:48:17] received stop signal, shutting down...
+[01:48:27] capture stopped
+[01:50:17] starting camera / AI inference (resolution=2)
+[01:50:18] starting audio (rate=32000)
+[01:50:19] data reader: TIMING resp.read() took 1024ms
+[01:50:21] data reader: TIMING resp.read() took 1214ms
+[01:50:22] data reader: TIMING resp.read() took 1153ms
+[01:50:23] data reader: TIMING resp.read() took 1205ms
+[01:50:24] data reader: TIMING resp.read() took 1210ms
+[01:50:26] data reader: TIMING resp.read() took 1323ms
+[01:50:27] data reader: TIMING resp.read() took 928ms
+[01:50:28] data reader: TIMING resp.read() took 1199ms
+[01:50:30] data reader: TIMING resp.read() took 1213ms
+[01:50:31] data reader: TIMING resp.read() took 1211ms
+[01:50:32] data reader: TIMING resp.read() took 1190ms
+[01:50:34] data reader: TIMING resp.read() took 1455ms
+[01:50:35] data reader: TIMING resp.read() took 1175ms
+[01:50:36] data reader: TIMING resp.read() took 1214ms
+[01:50:37] data reader: TIMING resp.read() took 1158ms
+[01:50:39] data reader: TIMING resp.read() took 1208ms
+[01:50:40] data reader: TIMING resp.read() took 956ms
+[01:50:41] data reader: TIMING resp.read() took 1188ms
+[01:50:41] received stop signal, shutting down...
+[01:50:42] data reader stopped, 0 detection batches + 147 audio frames saved, 0 CRC mismatches dropped
+[01:50:42] capture stopped
+[01:52:56] starting camera / AI inference (resolution=2)
+[01:52:57] starting audio (rate=32000)
+[01:52:58] data reader: TIMING resp.read() took 1031ms
+[01:52:59] data reader: TIMING resp.read() took 1112ms
+[01:53:01] data reader: TIMING resp.read() took 1189ms
+[01:53:02] data reader: TIMING resp.read() took 1156ms
+[01:53:03] data reader: TIMING resp.read() took 972ms
+[01:53:05] data reader: TIMING resp.read() took 1355ms
+[01:53:06] data reader: TIMING resp.read() took 1183ms
+[01:53:07] data reader: TIMING resp.read() took 1081ms
+[01:53:08] data reader: TIMING resp.read() took 1207ms
+[01:53:10] data reader: TIMING resp.read() took 1194ms
+[01:53:11] data reader: TIMING resp.read() took 963ms
+[01:53:11] received stop signal, shutting down...
+[01:53:21] capture stopped
+[19:14:39] starting camera / AI inference (resolution=2)
+[19:14:58] received stop signal, shutting down...
+[19:15:01] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 1/5): HTTP Error 500: Internal Server Error
+[19:15:46] start request to http://192.168.1.112/camera/start?resolution=2&mode=invoke&differed=0 failed (attempt 2/5): timed out
+[19:15:49] starting audio (rate=32000)
+[19:15:49] data reader stopped, 0 detection batches + 0 audio frames saved, 0 CRC mismatches dropped
+[19:15:50] capture stopped
+[19:16:19] starting camera / AI inference (resolution=2)
+[19:16:19] starting audio (rate=32000)
+[19:16:21] data reader: TIMING resp.read() took 1246ms
+[19:16:22] data reader: TIMING resp.read() took 1343ms
+[19:16:24] data reader: TIMING resp.read() took 1207ms
+[19:16:25] data reader: TIMING resp.read() took 1192ms
+[19:16:26] data reader: TIMING resp.read() took 1202ms
+[19:16:28] data reader: TIMING resp.read() took 1195ms
+[19:16:29] data reader: TIMING resp.read() took 1183ms
+[19:16:30] data reader: TIMING resp.read() took 1156ms
+[19:16:32] data reader: TIMING resp.read() took 1430ms
+[19:16:33] data reader: TIMING resp.read() took 1184ms
+[19:16:34] data reader: TIMING resp.read() took 1184ms
+[19:16:35] data reader: TIMING resp.read() took 1203ms
+[19:16:37] data reader: TIMING resp.read() took 1162ms
+[19:16:37] received stop signal, shutting down...
+[19:16:47] capture stopped
+[19:19:00] starting camera / AI inference (resolution=2)
+[19:19:00] starting audio (rate=32000)
+[19:19:02] data reader: TIMING resp.read() took 1031ms
+[19:19:03] data reader: TIMING resp.read() took 832ms
+[19:19:04] data reader: TIMING resp.read() took 945ms
+[19:19:05] data reader: TIMING resp.read() took 1178ms
+[19:19:06] data reader: TIMING resp.read() took 947ms
+[19:19:06] received stop signal, shutting down...
+[19:19:06] data reader stopped, 0 detection batches + 40 audio frames saved, 0 CRC mismatches dropped
+[19:19:06] capture stopped
+[19:29:48] starting camera / AI inference (resolution=2)
+[19:29:48] starting audio (rate=32000)
+[19:29:50] data reader: TIMING resp.read() took 1332ms
+[19:29:51] data reader: TIMING resp.read() took 1109ms
+[19:29:52] data reader: TIMING resp.read() took 1191ms
+[19:29:54] data reader: TIMING resp.read() took 1205ms
+[19:29:54] received stop signal, shutting down...
+[19:29:55] data reader: TIMING resp.read() took 970ms
+[19:29:55] data reader stopped, 1 detection batches + 40 audio frames saved, 0 CRC mismatches dropped
+[19:29:55] capture stopped
+[20:18:36] starting camera / AI inference (resolution=2)
+[20:18:37] starting audio (rate=32000)
+[20:18:38] data reader: TIMING resp.read() took 1028ms
+[20:18:41] data reader: TIMING resp.read() took 2464ms
+[20:18:42] data reader: TIMING resp.read() took 968ms
+[20:18:43] received stop signal, shutting down...
+[20:18:53] data reader: TIMING resp.read() took 10977ms
+[20:18:53] capture stopped
