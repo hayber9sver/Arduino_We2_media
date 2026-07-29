@@ -28,7 +28,6 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 
-#include "ST7735_XIAO.h"
 #include <esp_heap_caps.h>
 #include <esp_http_server.h>
 #include <freertos/semphr.h>
@@ -1007,12 +1006,10 @@ void initI2CCommandChannel() {
 //   - D2 (GPIO4): used briefly while the display's DC/RST were on D0/D1
 //     (freed by that same brief D4/D5 I2C move) - abandoned along with it
 //     when I2C reverted to D0/D1 and DC/RST moved to D2/D3 instead.
-// Every OTHER pin on this board's 11-pin header is now committed: D0/D1 =
-// I2C (WE2 AT-command channel), D2/D3 = display DC/RST, D4 = servo,
-// D6/D7 = UART from WE2, D8/D9/D10 = the display's default hardware SPI
-// SCK/MISO/MOSI. D3's old "WE2 reset" AI.begin() argument turned out to be
-// a no-op (a Seeed_Arduino_SSCMA library bug - see DISPLAY_RST_PIN's
-// comment), so wiring it to the display's RST line instead has no conflict.
+// 2026-07-29: the ST7735 display (and D2/D3/D8/D9/D10, everything it used)
+// was removed entirely - user no longer needed the part. Current pin
+// allocation: D0/D1 = I2C (WE2 AT-command channel), D4 = servo, D6/D7 =
+// UART from WE2. D2/D3/D5/D8/D9/D10 are all free.
 #define SERVO_PWM_PIN             (D4)
 #define SERVO_PWM_FREQ_HZ         (50)
 #define SERVO_PWM_RESOLUTION_BITS (14)  // 16384 steps - ample headroom at 50Hz, well under LEDC's freq*2^res limit
@@ -1117,54 +1114,12 @@ static void rampServoTo(int from_angle, int to_angle) {
 // under s_servo_mutex so two concurrent step requests can't race on the
 // read and silently drop a step.
 //
-// 2026-07-21: `persist` lets the caller defer both the NVS write AND the
-// display redraw instead of doing them on every single call - see
-// servoRampPoll()'s own comment for why a multi-step ramp only wants this
-// true on the step that actually reaches the target, not every intermediate
-// step. motor_left/right_handler (manual, human-paced single steps - each
-// one a deliberate final resting position) always pass true. Returns the
-// resulting angle.
-//
-// 2026-07-21: the display redraw specifically went through THREE attempts
-// this session before landing back here - kept as history, all three traps
-// are easy to fall back into if this is ever "simplified":
-//   1. Direct, unconditional displayShowMotorAngle() call every step (the
-//      original code): hardware-measured ~65-75ms per call (SPI text
-//      redraw on the ST7735), an order of magnitude slower than the
-//      PCA9685 I2C write - a 40-75 step sweep could burn 2.5-5+ seconds of
-//      loopTask time on redraws alone, directly stalling WE2 UART drain
-//      (loopTask's own priority-bump comment in camera_web_server.ino
-//      explains why that task being blocked at all is bad).
-//   2. Rate-limited to at most once per 250ms: measured on hardware to
-//      still cut resp.read() spikes down but NOT eliminate them, and the
-//      achieved gap between redraws came out to ~525ms, not the configured
-//      250ms - under sustained 32kHz-audio+camera load, loopTask is
-//      sensitive enough to ANY added per-iteration cost that a slower
-//      loop() cycle lets UART RX backlog grow, which makes the NEXT
-//      fetchFramedMessages() call take longer to drain, which delays the
-//      loop even further - a self-reinforcing bufferbloat-style cascade
-//      where a bounded, rate-limited cost turned into an unbounded-feeling
-//      one.
-//   3. Moved the SPI work off loopTask entirely onto a dedicated
-//      xTaskCreate()'d consumer task fed by a queue: this DID fix the
-//      loopTask-stall/latency-spike problem (hardware-confirmed), but
-//      xTaskCreate()'s stack (4096B, permanently allocated for the life of
-//      the process, not pooled/reused like everything else in this file)
-//      pushed this board's already-razor-thin heap over the edge under
-//      sustained 32kHz-audio+camera+motor load - hardware-confirmed via a
-//      real crash/reboot (USB re-enumerated) with heap stats logged right
-//      before it (free=6436 largest=1652 min_ever_free=348) showing severe
-//      fragmentation and near-total exhaustion. Reverted. This board's heap
-//      margin has bitten this exact way before (see AUDIO_POOL_SLOTS 3->4
-//      in the bridge memory doc) - ANY new persistent allocation here
-//      (task stack, static buffer, or otherwise) needs the same full
-//      combined-load hardware soak test as that, not just a couple of
-//      short sweeps, before it can be trusted.
-// The persist-gate below (skip the redraw on every non-final ramp step,
-// not just rate-limit it) is the one that's actually shipped: zero
-// additional heap cost, and the tradeoff (display doesn't animate live
-// during a sweep, only jumps to the final value once it settles) is a
-// reasonable price for a fix that doesn't reopen the heap-exhaustion risk.
+// 2026-07-21: `persist` lets the caller defer the NVS write instead of doing
+// it on every single call - see servoRampPoll()'s own comment for why a
+// multi-step ramp only wants this true on the step that actually reaches the
+// target, not every intermediate step (flash wear). motor_left/right_handler
+// (manual, human-paced single steps - each one a deliberate final resting
+// position) always pass true. Returns the resulting angle.
 static int stepServoAngle(int delta, bool persist) {
     MutexGuard servo_lock(s_servo_mutex);
     int        angle = s_servo_angle.load() + delta;
@@ -1190,14 +1145,6 @@ static int stepServoAngle(int delta, bool persist) {
     s_servo_target_angle.store(angle);
     if (persist) {
         s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, angle);
-        // "--" (not a possibly-misleading number) if LEDC setup itself
-        // failed - matches s_servo_available's own gating of the real PWM
-        // write just above. Only reached here on the step that actually
-        // settles (manual step, or a ramp's final step) - see this
-        // function's own comment for why intermediate ramp steps skip this
-        // entirely instead of merely rate-limiting it or moving it to
-        // another task.
-        displayShowMotorAngle(s_servo_available ? angle : -1);
     }
     return angle;
 }
@@ -1243,20 +1190,17 @@ void servoRampPoll() {
     if (abs(target - current) < abs(delta)) {
         delta = target - current;
     }
-    // 2026-07-21: only persist to NVS + redraw the display on the step that
-    // actually reaches target, not every intermediate step - computed from
-    // THIS call's own target/current snapshot, not re-read after the fact,
-    // so it stays correct even if motor_set_handler() stores a brand new
-    // target on the HTTP thread in between: the value this step writes is
-    // simply "the angle the servo is physically at right now", which is
-    // accurate regardless of what target changes to next - the ramp just
-    // continues toward the new one on the following tick and persists again
-    // whenever it (or a later one) is finally reached. Avoids doing either
-    // on every single 60ms tick of a sweep (flash wear + latency for NVS;
-    // for the display, see stepServoAngle()'s own comment for the full
-    // history of why this all-or-nothing gate is what's shipped, not a
-    // rate limit or a separate task) for a value that, for every step but
-    // the last, is immediately superseded anyway.
+    // 2026-07-21: only persist to NVS on the step that actually reaches
+    // target, not every intermediate step - computed from THIS call's own
+    // target/current snapshot, not re-read after the fact, so it stays
+    // correct even if motor_set_handler() stores a brand new target on the
+    // HTTP thread in between: the value this step writes is simply "the
+    // angle the servo is physically at right now", which is accurate
+    // regardless of what target changes to next - the ramp just continues
+    // toward the new one on the following tick and persists again whenever
+    // it (or a later one) is finally reached. Avoids flash wear from writing
+    // NVS on every single 60ms tick of a sweep for a value that, for every
+    // step but the last, is immediately superseded anyway.
     bool reaches_target = (current + delta == target);
     stepServoAngle(delta, reaches_target);
 }
@@ -1292,7 +1236,6 @@ void initServoMotor() {
     s_servo_available = ledcAttach(SERVO_PWM_PIN, SERVO_PWM_FREQ_HZ, SERVO_PWM_RESOLUTION_BITS);
     if (!s_servo_available) {
         log_w("initServoMotor: ledcAttach() failed on pin %d - servo control disabled", (int)SERVO_PWM_PIN);
-        displayShowMotorAngle(-1);
         return;
     }
 
@@ -1302,123 +1245,6 @@ void initServoMotor() {
     rampServoTo(last_angle, SERVO_BOOT_ANGLE);
     s_servo_angle.store(SERVO_BOOT_ANGLE);
     s_servo_prefs.putInt(SERVO_NVS_KEY_ANGLE, SERVO_BOOT_ANGLE);
-    displayShowMotorAngle(SERVO_BOOT_ANGLE);
-}
-
-// ---------------------------------------------------------------------------
-// 2026-07-19: ST7735 128x128 SPI status display (user-supplied, hardware-
-// verified ST7735_XIAO.cpp/.h - see that file for the actual panel driver).
-// Shows the board's WiFi IP and whether a /stream/data client is currently
-// connected. DC/RST are plain GPIO (per ST7735_XIAO's own design, not
-// hardware-auto CS) so any pins work; SCK/MOSI use the board's default
-// hardware SPI pins (D8/D10 on XIAO ESP32C3) since nothing else on this
-// board uses hardware SPI (startRemoteProxy()'s PROTO_SPI case is dead code
-// - PROTO_UART is what's actually selected).
-//
-// 2026-07-21: DISPLAY_CS_PIN is -1 (no GPIO control) - the panel's CS line
-// is tied permanently to GND in hardware instead. Only valid because this
-// display is the ONLY device on the SPI bus - see ST7735_XIAO's own
-// constructor comment.
-//
-// 2026-07-26: DC=D2/RST=D3 (briefly D0/D1 during a since-reverted attempt
-// to move the WE2 I2C channel onto D4/D5 - see initI2CCommandChannel()'s
-// comment - I2C is back on D0/D1, so DC/RST moved to D2/D3 instead). RST
-// on D3 specifically is safe despite D3 ALSO being AI.begin(&atSerial,
-// D3)'s WE2 reset-pulse argument (startRemoteProxy()'s PROTO_UART case):
-// that pulse never actually happens. Confirmed by reading
-// Seeed_Arduino_SSCMA.cpp - its HardwareSerial overload of begin() reads
-// `_rst` to decide whether to drive the pin, but (unlike the TwoWire/
-// SPIClass overloads, which both do) never assigns `_rst = rst` first, so
-// `_rst` stays at the constructor's -1 default and the `if (_rst >= 0)`
-// reset block never runs, regardless of what pin is passed. This is a
-// library bug, confirmed by source inspection rather than by observed
-// misbehavior - nothing here ever relied on that pulse actually happening
-// - so ST7735_XIAO driving D3 as RST has no real conflict with it.
-#define DISPLAY_CS_PIN  (-1)
-#define DISPLAY_DC_PIN  (D2)
-#define DISPLAY_RST_PIN (D3)
-
-#define DISPLAY_COLOR_BLACK  (0x0000)
-#define DISPLAY_COLOR_WHITE  (0xFFFF)
-#define DISPLAY_COLOR_GREEN  (0x07E0)
-#define DISPLAY_COLOR_YELLOW (0xFFE0)
-
-static ST7735_XIAO   s_display(DISPLAY_CS_PIN, DISPLAY_DC_PIN, DISPLAY_RST_PIN);
-static bool          s_display_ready = false;
-// Guards SPI transactions against interleaving from concurrent callers -
-// displayShowClientStatus() is called from httpd worker tasks (stream
-// connect/disconnect), displayShowIP() from the main task at boot; the
-// ST7735_XIAO driver itself has no locking of its own (matches this
-// codebase's existing pattern of guarding shared-bus access at the call
-// site - see s_cmd_mutex's own comment).
-static SemaphoreHandle_t s_display_mutex = NULL;
-
-void initDisplay() {
-    s_display_mutex = xSemaphoreCreateMutex();
-    s_display.begin();
-    s_display.fillScreen(DISPLAY_COLOR_BLACK);
-    s_display.drawText(2, 2, "WiFi IP:", DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
-    s_display.drawText(2, 40, "Client:", DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
-    s_display.drawText(2, 78, "Motor:", DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
-    s_display_ready = true;
-    // Boot default, matches s_data_stream_clients' own initial value (0) -
-    // updated for real once startCameraServer() is up and a client can
-    // actually connect.
-    s_display.drawText(2, 52, "WAITING   ", DISPLAY_COLOR_YELLOW, 2, DISPLAY_COLOR_BLACK, true);
-    // Placeholder until initServoMotor() (called after initDisplay() in
-    // camera_web_server.ino's setup()) determines the real angle - or
-    // decides the LEDC PWM setup itself failed, see
-    // displayShowMotorAngle()'s own negative-angle case.
-    s_display.drawText(2, 90, "--       ", DISPLAY_COLOR_WHITE, 2, DISPLAY_COLOR_BLACK, true);
-}
-
-void displayShowIP(const char* ip) {
-    if (!s_display_ready) {
-        return;
-    }
-    MutexGuard lock(s_display_mutex);
-    // Fixed-width blank-pad (up to 21 chars comfortably fits this 128px-wide
-    // panel at text size 1) so a shorter new IP fully overwrites a longer
-    // old one - same reasoning as displayShowClientStatus()'s own padding.
-    char buf[22];
-    snprintf(buf, sizeof(buf), "%-21s", ip);
-    s_display.drawText(2, 14, buf, DISPLAY_COLOR_WHITE, 1, DISPLAY_COLOR_BLACK, true);
-}
-
-void displayShowClientStatus(bool connected) {
-    if (!s_display_ready) {
-        return;
-    }
-    MutexGuard lock(s_display_mutex);
-    // Blank-padded to a fixed width ("CONNECTED " is the longest) so
-    // switching between the two never leaves stray characters from the
-    // previous, longer string un-overwritten.
-    if (connected) {
-        s_display.drawText(2, 52, "CONNECTED ", DISPLAY_COLOR_GREEN, 2, DISPLAY_COLOR_BLACK, true);
-    } else {
-        s_display.drawText(2, 52, "WAITING   ", DISPLAY_COLOR_YELLOW, 2, DISPLAY_COLOR_BLACK, true);
-    }
-}
-
-// angle < 0 means "LEDC PWM setup failed" (see s_servo_available) - shown
-// as "--" rather than a number that would otherwise look like a real,
-// currently-held position.
-void displayShowMotorAngle(int angle) {
-    if (!s_display_ready) {
-        return;
-    }
-    MutexGuard lock(s_display_mutex);
-    char text[8];
-    if (angle < 0) {
-        snprintf(text, sizeof(text), "--");
-    } else {
-        snprintf(text, sizeof(text), "%d deg", angle);
-    }
-    // Blank-padded to a fixed width ("180 deg" is the longest possible
-    // value) so a shorter new value never leaves stray characters behind.
-    char buf[10];
-    snprintf(buf, sizeof(buf), "%-9s", text);
-    s_display.drawText(2, 90, buf, DISPLAY_COLOR_WHITE, 2, DISPLAY_COLOR_BLACK, true);
 }
 
 inline uint16_t getMsgType(const char* resp, size_t len) {
@@ -2213,7 +2039,6 @@ static void disconnectStreamClient(const char* reason) {
           (int)s_data_stream_clients.load(), reason);
     if (s_data_stream_clients.load() <= 0) {
         sendBreakBestEffort();
-        displayShowClientStatus(false);
     }
 }
 
@@ -2416,7 +2241,6 @@ static esp_err_t stream_data_handler(httpd_req_t* req) {
     // See s_data_stream_clients' own comment - pushPBSlot() checks this to
     // decide whether AUDIO backlog is worth retaining at all.
     s_data_stream_clients += 1;
-    displayShowClientStatus(true);
     // TEMP DIAGNOSTIC (2026-07-17) - see disconnectStreamClient()'s comment.
     log_w("DBG stream_data_handler CONNECT heap: free=%u largest=%u",
           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),

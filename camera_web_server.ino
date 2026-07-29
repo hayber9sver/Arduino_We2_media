@@ -41,18 +41,6 @@ void setup() {
     Serial.setDebugOutput(true);
     Serial.println();
 
-    // 2026-07-27: moved ahead of WiFi.begin() - WiFi's own connection
-    // attempts (visible as repeated AUTH_FAIL/AUTH_EXPIRE retries, several
-    // seconds of RF-heavy TX bursts) draw current on the same 3.3V rail the
-    // display shares, right as initDisplay()'s SPI/reset sequence used to
-    // run immediately after "WiFi connected" - a marginal supply during
-    // that window is a plausible explanation for the panel coming up blank
-    // (ST7735_XIAO has no error reporting, so a failed init is silent).
-    // Initializing the panel first, on a quiet/idle power rail before WiFi
-    // radio activity starts, avoids that window entirely. displayShowIP()
-    // still needs the IP so it stays after WiFi connects.
-    initDisplay();
-
     WiFi.begin(ssid, password);
     WiFi.setSleep(false);
 
@@ -64,7 +52,6 @@ void setup() {
     Serial.println("WiFi connected");
 
     startRemoteProxy(PROTO_UART);
-    displayShowIP(WiFi.localIP().toString().c_str());
     initI2CCommandChannel();
     initServoMotor();
     startCameraServer();
